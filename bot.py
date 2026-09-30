@@ -17,12 +17,13 @@ import logging
 import os
 import re
 import signal
+import sqlite3
 import tempfile
 from datetime import date, datetime, timedelta
 from datetime import time as dtime
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote_plus
+from urllib.parse import quote, quote_plus
 from zoneinfo import ZoneInfo
 
 from telegram import (
@@ -645,9 +646,9 @@ def fmt_long(d: date) -> str:
     return f"{d:%A} {d.day} {d:%B %Y}"
 
 
-def _row_date(row: dict) -> date | None:
+def _row_date(row: dict, key: str = "date") -> date | None:
     with contextlib.suppress(ValueError, TypeError):
-        return date.fromisoformat(str(row.get("date")))
+        return date.fromisoformat(str(row.get(key)))
     return None
 
 
@@ -1047,6 +1048,197 @@ class ClaudeRunner:
 
 
 # ---------------------------------------------------------------------------
+# Garmin data from garmin-monitor (read only)
+# ---------------------------------------------------------------------------
+
+GARMIN_COLUMNS = (
+    "day, resting_hr, resting_hr_7d_avg, sleep_seconds, sleep_score, hrv_last_night, "
+    "hrv_weekly_avg, hrv_status, body_battery_high, body_battery_low, body_battery_latest, "
+    "activities_json, last_sync"
+)
+
+
+@dataclasses.dataclass
+class GarminSummary:
+    ok: bool
+    context: str  # for Claude
+    short: str  # one line for /profile and /status
+    recovery_flags: list[str]
+
+
+class GarminReader:
+    """Reads garmin-monitor's SQLite database without ever writing to it.
+
+    garmin-monitor keeps the database in WAL mode. While it runs, a normal read only open
+    sees its newest rows. After a clean shutdown the -shm file is gone and a read only
+    mount cannot recreate it, so the reader falls back to an immutable open.
+    """
+
+    def __init__(self, path: str, profile: str):
+        self.path = path
+        self.profile = profile
+
+    def _query(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
+        if not Path(self.path).is_file():
+            raise FileNotFoundError(self.path)
+        last_error: Exception | None = None
+        for options in ("mode=ro", "mode=ro&immutable=1"):
+            conn = None
+            try:
+                conn = sqlite3.connect(f"file:{quote(self.path)}?{options}", uri=True, timeout=5)
+                conn.row_factory = sqlite3.Row
+                return conn.execute(sql, params).fetchall()
+            except sqlite3.OperationalError as exc:
+                last_error = exc
+                if "no such table" in str(exc) and options.endswith("immutable=1"):
+                    break
+            finally:
+                if conn is not None:
+                    conn.close()
+        raise last_error or sqlite3.OperationalError("could not read the database")
+
+    def rows(self, since: date, until: date) -> list[dict]:
+        rows = self._query(
+            f"SELECT {GARMIN_COLUMNS} FROM daily_snapshots WHERE profile = ? AND day >= ? AND day <= ? ORDER BY day",
+            (self.profile, since.isoformat(), until.isoformat()),
+        )
+        return [dict(r) for r in rows]
+
+    def profiles(self) -> list[str]:
+        return [r[0] for r in self._query("SELECT DISTINCT profile FROM daily_snapshots ORDER BY profile")]
+
+    def summary(self, today: date, days: int, tz: ZoneInfo) -> GarminSummary:
+        try:
+            rows = self.rows(today - timedelta(days=days - 1), today)
+            if not rows:
+                others = self.profiles()
+                found = f" (profiles found: {', '.join(others)})" if others else ""
+                msg = f"no data for profile '{self.profile}' in the last {days} days{found}"
+                return GarminSummary(False, f"Garmin data: not available ({msg}).", msg, [])
+        except FileNotFoundError:
+            msg = f"no database at {self.path}"
+            return GarminSummary(False, "Garmin data: not available right now.", msg, [])
+        except sqlite3.Error as exc:
+            log.warning("Could not read Garmin data from %s: %s", self.path, exc)
+            msg = f"could not read {self.path} ({exc})"
+            return GarminSummary(False, "Garmin data: not available right now.", msg, [])
+        return summarize_garmin(rows, today, days, tz)
+
+
+def _hours(seconds: Any) -> str | None:
+    return f"{seconds / 3600:.1f} h" if isinstance(seconds, (int, float)) and seconds > 0 else None
+
+
+def _duration(seconds: float) -> str:
+    seconds = int(round(seconds))
+    h, rest = divmod(seconds, 3600)
+    m, s = divmod(rest, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _activities(row: dict) -> list[dict]:
+    with contextlib.suppress(ValueError, TypeError):
+        items = json.loads(row.get("activities_json") or "[]")
+        return [a for a in items if isinstance(a, dict)]
+    return []
+
+
+def recovery_flags(row: dict, history: list[dict]) -> list[str]:
+    """Signs of poor recovery on one day: short sleep, low body battery, low HRV, high RHR."""
+    flags = []
+    sleep = row.get("sleep_seconds")
+    if isinstance(sleep, (int, float)) and 0 < sleep < 6 * 3600:
+        flags.append(f"short sleep ({_hours(sleep)})")
+    battery = row.get("body_battery_high")
+    if isinstance(battery, (int, float)) and battery < 40:
+        flags.append(f"body battery only reached {int(battery)}")
+    hrv = row.get("hrv_last_night")
+    earlier = [h["hrv_last_night"] for h in history if isinstance(h.get("hrv_last_night"), (int, float))]
+    usual = row.get("hrv_weekly_avg") or (sum(earlier) / len(earlier) if earlier else None)
+    if isinstance(hrv, (int, float)) and usual and hrv < 0.9 * usual:
+        flags.append(f"HRV {hrv:.0f}, below your usual {usual:.0f}")
+    elif str(row.get("hrv_status") or "").upper() in ("LOW", "POOR"):
+        flags.append(f"HRV status {str(row['hrv_status']).lower()}")
+    rhr, rhr_avg = row.get("resting_hr"), row.get("resting_hr_7d_avg")
+    if isinstance(rhr, (int, float)) and isinstance(rhr_avg, (int, float)) and rhr >= rhr_avg + 5:
+        flags.append(f"resting HR {rhr:.0f}, {rhr - rhr_avg:.0f} above your 7 day average")
+    return flags
+
+
+def summarize_garmin(rows: list[dict], today: date, days: int, tz: ZoneInfo) -> GarminSummary:
+    lines = [f"Garmin data from my watch, last {days} days (oldest first):"]
+    runs, other, seen = [], [], set()
+    for row in rows:
+        d = _row_date(row, "day")
+        if not d:
+            continue
+        bits = []
+        if (h := _hours(row.get("sleep_seconds"))):
+            bits.append(f"sleep {h}" + (f" (score {row['sleep_score']})" if row.get("sleep_score") else ""))
+        if row.get("resting_hr"):
+            avg = f" (7 day avg {row['resting_hr_7d_avg']})" if row.get("resting_hr_7d_avg") else ""
+            bits.append(f"resting HR {row['resting_hr']}{avg}")
+        if row.get("hrv_last_night"):
+            extra = [f"weekly avg {row['hrv_weekly_avg']:.0f}" if row.get("hrv_weekly_avg") else "", str(row.get("hrv_status") or "").lower()]
+            extra = [e for e in extra if e]
+            bits.append(f"HRV {row['hrv_last_night']:.0f}" + (f" ({', '.join(extra)})" if extra else ""))
+        if row.get("body_battery_high") is not None:
+            bits.append(f"body battery high {row['body_battery_high']}, low {row.get('body_battery_low')}")
+        lines.append(f"{fmt_day(d)}: " + (", ".join(bits) if bits else "no data"))
+        for act in _activities(row):
+            key = act.get("activity_id") or (act.get("start"), act.get("type"))
+            if key in seen or act.get("source") == "auto_detected":
+                continue
+            seen.add(key)
+            kind = str(act.get("type") or "activity")
+            dur = act.get("duration_s")
+            dist = act.get("distance_m")
+            hr = f", avg HR {act['avg_hr']}" if act.get("avg_hr") else ""
+            if "run" in kind.lower():
+                text = f"{fmt_day(d)}: {act.get('name') or 'Run'}"
+                if isinstance(dist, (int, float)) and dist > 0:
+                    text += f", {dist / 1000:.1f} km"
+                if isinstance(dur, (int, float)) and dur > 0:
+                    text += f" in {_duration(dur)}"
+                    if isinstance(dist, (int, float)) and dist > 0:
+                        text += f" ({_duration(dur / (dist / 1000))} /km)"
+                runs.append((text + hr, dist if isinstance(dist, (int, float)) else 0))
+            else:
+                mins = f" {dur / 60:.0f} min" if isinstance(dur, (int, float)) and dur > 0 else ""
+                other.append(f"{fmt_day(d)}: {kind.replace('_', ' ')}{mins}{hr}")
+    if runs:
+        total = sum(dist for _, dist in runs) / 1000
+        lines.append(f"Runs in these {days} days: {len(runs)}, {total:.1f} km in total.")
+        lines += [f"• {text}" for text, _ in runs]
+    else:
+        lines.append(f"Runs in these {days} days: none recorded.")
+    if other:
+        lines.append("Other activities: " + "; ".join(other) + ".")
+    latest = rows[-1]
+    latest_day = _row_date(latest, "day")
+    flags: list[str] = []
+    if latest_day == today:
+        flags = recovery_flags(latest, rows[:-1])
+        lines.append(
+            "Recovery today looks low: " + ", ".join(flags) + "."
+            if flags
+            else "Recovery today looks fine."
+        )
+    elif latest_day:
+        lines.append(f"No Garmin data for today yet. The latest is from {fmt_day(latest_day)}, so it may be out of date.")
+    sync = ""
+    with contextlib.suppress(ValueError, TypeError):
+        synced = datetime.fromisoformat(str(latest.get("last_sync")))
+        if synced.tzinfo is None:
+            synced = synced.replace(tzinfo=ZoneInfo("UTC"))
+        sync = f", watch last synced {fmt_day(synced.astimezone(tz).date())} {synced.astimezone(tz):%H:%M}"
+    short = f"latest data {fmt_day(latest_day)}{sync}" if latest_day else "no dated rows"
+    if latest_day == today:
+        short += ". Recovery today " + ("looks low: " + ", ".join(flags) if flags else "looks fine")
+    return GarminSummary(True, "\n".join(lines), short, flags)
+
+
+# ---------------------------------------------------------------------------
 # The coach prompt
 # ---------------------------------------------------------------------------
 
@@ -1171,6 +1363,7 @@ class Coach:
         self.cfg = cfg
         self.store = store or Store(cfg.data_dir)
         self.runner = runner or ClaudeRunner(cfg)
+        self.garmin = GarminReader(cfg.garmin_db, cfg.garmin_profile)
         self.plan_lock = asyncio.Lock()
 
     # -- time and weeks -----------------------------------------------------
@@ -1257,16 +1450,25 @@ class Coach:
             parts.append(garmin)
         return parts
 
+    def garmin_summary(self, today: date) -> GarminSummary:
+        return self.garmin.summary(today, self.cfg.garmin_days, self.cfg.tz)
+
     def garmin_context(self, today: date) -> str | None:
-        """Stage 3 adds the Garmin summary."""
-        return None
+        return self.garmin_summary(today).context
 
     def garmin_profile_line(self, today: date) -> str | None:
-        return None
+        summary = self.garmin_summary(today)
+        return summary.short[:1].upper() + summary.short[1:] + "."
 
     def recovery_note(self, today: date) -> str | None:
-        """Stage 3: a warning when Garmin shows poor recovery."""
-        return None
+        """A heads up for the session reminder when Garmin shows poor recovery."""
+        flags = self.garmin_summary(today).recovery_flags
+        if not flags:
+            return None
+        return (
+            "⚠️ Your Garmin data says recovery looks low today: " + ", ".join(flags) + ". "
+            "Go lighter today, or ask me for a lighter version of this session."
+        )
 
     def system_prompt(self) -> str:
         now = self.now()
@@ -2034,8 +2236,9 @@ async def status_text(coach: Coach, application: Application) -> str:
 
 
 def status_extra(coach: Coach) -> list[str]:
-    """Later stages add Garmin status here."""
-    return []
+    summary = coach.garmin_summary(coach.today())
+    icon = "✅" if summary.ok else "⚠️"
+    return ["", "**Garmin**", f"• {icon} Profile {coach.cfg.garmin_profile}: {summary.short}"]
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
