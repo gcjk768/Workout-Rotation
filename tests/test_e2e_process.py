@@ -40,6 +40,7 @@ def test_real_bot_process(tmp_path):
         "CLAUDE_WORK_DIR": str(tmp_path / "work"),
         "GARMIN_DB": str(garmin / "monitor.db"),
         "FAKE_CLAUDE_LOG": str(tmp_path / "claude.jsonl"),
+        "FAKE_CLAUDE_STRUCTURED": "1",
         "TZ": "Asia/Singapore",
     }
     log_path = tmp_path / "bot.log"

@@ -41,9 +41,9 @@ def run(api: FakeBotAPI, expect_garmin: bool = True, claude_version: str = "2.1.
     # start up: command menu, webhook removed, long polling for messages and buttons only
     _, cmds = api.wait_for(lambda m, p: m == "setMyCommands", 60)
     names = [c["command"] for c in cmds["commands"]]
-    assert names == ["ask", "today", "week", "plan", "nextweek", "log", "done", "shoulder", "progress",
+    assert names == ["ask", "today", "week", "day", "plan", "nextweek", "log", "done", "shoulder", "progress",
                      "injury", "away", "profile", "status", "reset", "whoami"], names
-    done.append("command menu registered (15 commands)")
+    done.append("command menu registered (16 commands)")
     _, poll = api.wait_for(lambda m, p: m == "getUpdates" and "allowed_updates" in p, 60)
     assert sorted(poll["allowed_updates"]) == ["callback_query", "message"], poll
     done.append("long polling for messages and button presses")
@@ -88,6 +88,14 @@ def run(api: FakeBotAPI, expect_garmin: bool = True, claude_version: str = "2.1.
     api.message("/today", OWNER)
     api.reply(OWNER, "📅", after=mark)
     done.append("/today")
+
+    mark = api.mark()
+    api.message("/day fri", OWNER)
+    friday = api.reply(OWNER, "📅 Friday", after=mark)
+    assert friday.get("parse_mode") == "HTML", friday
+    if not real_claude:  # the fake returns a structured plan: body part workout cards
+        assert "<blockquote expandable>" in friday["text"] and "SWIM" in friday["text"], friday["text"][:300]
+    done.append("/day fri shows Friday's workout card")
 
     mark = api.mark()
     api.message("/log rows 22kg 3x10, floor press 14kg 3x8 felt easy", OWNER)

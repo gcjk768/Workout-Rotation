@@ -307,6 +307,7 @@ class Config:
     garmin_auto_done: bool = True
     holidays_country: str = "SG"
     safety_review: bool = True
+    structured_plans: bool = True
     claude_retry_delay: float = 5.0
     ask_timeout: int = 240
     plan_timeout: int = 600
@@ -390,6 +391,7 @@ class Config:
             garmin_auto_done=parse_switch(env.get("GARMIN_AUTO_DONE"), True),
             holidays_country=get("HOLIDAYS_COUNTRY", "SG") if "HOLIDAYS_COUNTRY" not in env else _clean(env["HOLIDAYS_COUNTRY"]),
             safety_review=parse_switch(env.get("SAFETY_REVIEW"), True),
+            structured_plans=parse_switch(env.get("STRUCTURED_PLANS"), True),
             claude_retry_delay=float(get("CLAUDE_RETRY_DELAY", "5")),
             secrets=[
                 v
@@ -526,12 +528,25 @@ class Store:
     def load_plan_meta(self, monday: date) -> dict:
         return self.read_json(f"plans/{monday.isoformat()}.json", {})
 
-    def save_plan(self, monday: date, text: str, meta: dict, stamp: str) -> None:
+    def load_plan_data(self, monday: date) -> dict | None:
+        """The structured version of the plan (for the workout cards), if it has one."""
+        return normalize_plan(self.read_json(f"plans/{monday.isoformat()}.plan.json", None))
+
+    def save_plan(self, monday: date, text: str, meta: dict, stamp: str, data: dict | None = None) -> None:
         path = self.plan_path(monday)
+        data_path = self.root / "plans" / f"{monday.isoformat()}.plan.json"
+        history = self.root / "plans" / "history"
         if path.exists():  # keep every earlier version
-            backup = self.root / "plans" / "history" / f"{monday.isoformat()}_{stamp}.md"
-            backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+            (history / f"{monday.isoformat()}_{stamp}.md").write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+        if data_path.exists():
+            (history / f"{monday.isoformat()}_{stamp}.plan.json").write_text(
+                data_path.read_text(encoding="utf-8"), encoding="utf-8"
+            )
         self._write(path, text.rstrip() + "\n")
+        if data:
+            self.write_json(f"plans/{monday.isoformat()}.plan.json", data)
+        elif data_path.exists():
+            data_path.unlink()  # a text plan replaced it
         self.write_json(f"plans/{monday.isoformat()}.json", meta)
 
     def plan_mondays(self) -> list[date]:
@@ -1201,6 +1216,7 @@ class ClaudeError(Exception):
         super().__init__(detail or user_message)
         self.user_message = user_message
         self.transient = transient  # worth one automatic retry
+        self.timed_out = False
 
 
 AUTH_RE = re.compile(
@@ -1257,7 +1273,7 @@ class ClaudeRunner:
         env["DISABLE_AUTOUPDATER"] = "1"
         return env
 
-    def command(self, kind: str, prompt_file: str) -> list[str]:
+    def command(self, kind: str, prompt_file: str, schema: dict | None = None) -> list[str]:
         model = {"ask": self.cfg.model_ask, "review": self.cfg.model_check}.get(kind, self.cfg.model_plan)
         cmd = [
             self.cfg.claude_bin,
@@ -1276,6 +1292,8 @@ class ClaudeRunner:
             cmd += ["--tools", "WebSearch", "--allowedTools", "WebSearch", "--max-turns", "10"]
         else:
             cmd += ["--tools", "", "--max-turns", "3"]
+        if schema:  # the reply comes back as data through a tool call, so it needs 2+ turns
+            cmd += ["--json-schema", json.dumps(schema, separators=(",", ":"))]
         return cmd
 
     async def _exec(self, cmd: list[str], stdin: bytes | None, timeout: float):
@@ -1299,13 +1317,14 @@ class ClaudeRunner:
             raise
         return proc.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
 
-    async def run(self, system_prompt: str, message: str, kind: str) -> str:
-        """kind is 'ask' (web search on), 'plan' or 'review' (no tools). Returns the reply text.
+    async def run(self, system_prompt: str, message: str, kind: str, schema: dict | None = None) -> str:
+        """kind is 'ask' (web search on), 'plan' or 'review' (no tools). Returns the reply text,
+        or with a schema the structured reply as JSON text.
 
         A brief failure (overloaded, a 5xx error, a network blip) is retried once."""
         for attempt in (1, 2):
             try:
-                result = await self._run(system_prompt, message, kind)
+                result = await self._run(system_prompt, message, kind, schema)
             except ClaudeError as exc:
                 if exc.transient and attempt == 1:
                     log.warning("claude %s failed briefly, retrying once in %ss", kind, self.cfg.claude_retry_delay)
@@ -1317,22 +1336,24 @@ class ClaudeRunner:
             return result
         raise AssertionError("unreachable")
 
-    async def _run(self, system_prompt: str, message: str, kind: str) -> str:
+    async def _run(self, system_prompt: str, message: str, kind: str, schema: dict | None = None) -> str:
         timeout = self.cfg.plan_timeout if kind == "plan" else self.cfg.ask_timeout
         fd, prompt_file = tempfile.mkstemp(prefix="coach-system-", suffix=".md")
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(system_prompt)
-        cmd = self.command(kind, prompt_file)
+        cmd = self.command(kind, prompt_file, schema)
         started = asyncio.get_running_loop().time()
         try:
             async with self._slots:
                 code, out, err = await self._exec(cmd, message.encode("utf-8"), timeout)
         except asyncio.TimeoutError as exc:
             minutes = round(timeout / 60)
-            raise ClaudeError(
+            error = ClaudeError(
                 f"Claude Code took longer than {minutes} minutes, so I stopped it. "
                 "Please try again, or ask something shorter."
-            ) from exc
+            )
+            error.timed_out = True
+            raise error from exc
         except FileNotFoundError as exc:
             raise ClaudeError(
                 "Claude Code is not installed in the container (the claude command was not found)."
@@ -1404,6 +1425,9 @@ class ClaudeRunner:
                 raise ClaudeError(MSG_NETWORK, detail)
             snippet = redact((result or subtype or "unknown error").strip()[:200], self.cfg.secrets)
             raise ClaudeError(f"Claude Code reported an error: {snippet}", detail)
+        structured = data.get("structured_output")
+        if isinstance(structured, (dict, list)):
+            return json.dumps(structured, ensure_ascii=False)
         if not result.strip():
             raise ClaudeError("Claude Code sent an empty reply. Please try again.")
         return result.strip()
@@ -1788,6 +1812,361 @@ PLAN_FORMAT_RULES = """Format rules. The bot reads your plan automatically, so f
 
 
 # ---------------------------------------------------------------------------
+# Structured plans: Claude returns data, the bot lays out the workout cards
+# ---------------------------------------------------------------------------
+
+_EXERCISE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "superset": {"type": "string", "description": "A1, A2 when two exercises are paired, else empty"},
+        "sets": {"type": "integer"},
+        "reps": {"type": "string", "description": "10, 8-10, 30 s or 400 m"},
+        "load": {"type": "string", "description": "12.5 kg, bodyweight, light band or easy pace"},
+        "rest_s": {"type": "integer", "description": "rest between sets in seconds"},
+        "effort": {"type": "string", "description": "RPE 7, or 3 reps in reserve"},
+        "tempo": {"type": "string", "description": "3-1-1, or empty"},
+        "muscles": {"type": "string", "description": "the muscles it trains"},
+        "cue": {"type": "string", "description": "one short form cue"},
+        "left_arm": {"type": "string", "description": "how the injured left arm does it, or empty"},
+        "video": {"type": "string", "description": "YouTube search words, like single arm cable row proper form"},
+        "swap": {"type": "string", "description": "a shoulder friendly swap"},
+    },
+    "required": ["name", "sets", "reps", "load", "rest_s", "effort", "muscles", "cue", "video"],
+}
+PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "split_explanation": {"type": "string"},
+        "days": {
+            "type": "array",
+            "minItems": 7,
+            "maxItems": 7,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "day": {"type": "string", "enum": DAY_NAMES},
+                    "focus": {"type": "string"},
+                    "rest_day": {"type": "boolean"},
+                    "minutes": {"type": "integer"},
+                    "warm_up": {"type": "array", "items": {"type": "string"}},
+                    "sections": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "body_part": {"type": "string"},
+                                "exercises": {"type": "array", "items": _EXERCISE_SCHEMA},
+                            },
+                            "required": ["body_part", "exercises"],
+                        },
+                    },
+                    "cool_down": {"type": "array", "items": {"type": "string"}},
+                    "note": {"type": "string"},
+                },
+                "required": ["day", "focus", "rest_day", "warm_up", "sections", "cool_down"],
+            },
+        },
+        "notes": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["days", "notes"],
+}
+STRUCTURED_RULES = """How to fill in the plan. The bot lays it out for Telegram, so write plain words in every field (no markdown, no emojis):
+1. Seven days, Monday to Sunday, in order. A rest day has rest_day true and a focus like "Rest or light mobility" or "Basketball or rest"; it may hold a short Mobility section.
+2. Group each training day into sections by body part, in training order: the main compound work first, then secondary and accessory work, then core, conditioning or the run. Name sections by body part, like Back, Chest, Shoulders, Arms, Legs, Glutes, Core, Court skills, Conditioning, Run, Swim or Mobility. On upper body days add a "Shoulder rehab" section.
+3. For every exercise give sets, reps (10, 8-10 or 30 s), load (a real starting weight in kg based on my logs, or bodyweight or light band), rest in seconds, effort as RPE that matches this week's effort, tempo, the muscles it trains, one short form cue, how my left arm does it (left_arm, only when the exercise uses the arms), YouTube search words for a form video (like "single arm cable row proper form") and a shoulder friendly swap. Pair two exercises as a superset with A1 and A2 in superset when that saves time.
+4. Friday has a "Swim" section and a "Legs (if you do not swim)" section, plus the run with distance or time and pace.
+5. Keep each day within my session time and put the total in minutes.
+6. warm_up and cool_down are short lists of steps. note is one or two short sentences for the day, or empty.
+7. notes are the week's general notes, one short sentence each.
+8. The video field holds only the search words, without [yt: ]. Write no dashes; use commas instead.
+9. {split_rule}"""
+
+_PLAN_TEXT_FIELDS = ("name", "superset", "reps", "load", "effort", "tempo", "muscles", "cue", "left_arm", "video", "swap")
+
+
+def _one_line(value: Any) -> str:
+    return " ".join(str(value).split()) if value not in (None, "") else ""
+
+
+def _as_int(value: Any) -> int:
+    with contextlib.suppress(TypeError, ValueError):
+        return max(0, int(float(value)))
+    return 0
+
+
+def normalize_plan(data: Any) -> dict | None:
+    """Check and tidy the plan Claude returned; None when it is not a usable plan."""
+    if isinstance(data, str):
+        with contextlib.suppress(ValueError):
+            data = json.loads(clean_reply(data))
+    if not isinstance(data, dict) or not isinstance(data.get("days"), list):
+        return None
+    days: dict[int, dict] = {}
+    for raw in data["days"]:
+        if not isinstance(raw, dict):
+            continue
+        idx = DAY_LOOKUP.get(_one_line(raw.get("day")).lower())
+        if idx is None or idx in days:
+            continue
+        sections = []
+        for sec in raw.get("sections") or []:
+            if not isinstance(sec, dict):
+                continue
+            exercises = []
+            for ex in sec.get("exercises") or []:
+                if isinstance(ex, dict) and _one_line(ex.get("name")):
+                    item = {key: _one_line(ex.get(key)).replace("**", "")[:300] for key in _PLAN_TEXT_FIELDS}
+                    item["video"] = re.sub(r"^\[?\s*yt:\s*|\]$", "", item["video"], flags=re.IGNORECASE).strip()
+                    item.update(sets=_as_int(ex.get("sets")), rest_s=_as_int(ex.get("rest_s")))
+                    exercises.append(item)
+            if exercises:
+                sections.append({"body_part": _one_line(sec.get("body_part")) or "Workout", "exercises": exercises})
+        focus = _one_line(raw.get("focus")) or ("Rest" if raw.get("rest_day") else "Training")
+        if raw.get("rest_day") is True and not is_rest_focus(focus):
+            focus += " (rest day)"  # the reminders read rest days from the focus
+        days[idx] = {
+            "day": DAY_NAMES[idx],
+            "focus": focus,
+            "rest_day": bool(raw.get("rest_day")),
+            "minutes": _as_int(raw.get("minutes")),
+            "warm_up": [_one_line(w) for w in raw.get("warm_up") or [] if _one_line(w)],
+            "sections": sections,
+            "cool_down": [_one_line(c) for c in raw.get("cool_down") or [] if _one_line(c)],
+            "note": _one_line(raw.get("note")),
+        }
+    if not days:
+        return None
+    return {
+        "split_explanation": _one_line(data.get("split_explanation")),
+        "days": [days[i] for i in sorted(days)],
+        "notes": [_one_line(n) for n in data.get("notes") or [] if _one_line(n)],
+    }
+
+
+def _dose(ex: dict) -> str:
+    parts = [f"{ex['sets']} x {ex['reps']}" if ex["sets"] else ex["reps"]]
+    if ex["load"]:
+        parts.append(ex["load"])
+    if ex["rest_s"]:
+        parts.append(f"rest {ex['rest_s']}s")
+    if ex["effort"]:
+        parts.append(ex["effort"])
+    if ex["tempo"]:
+        parts.append(f"tempo {ex['tempo']}")
+    return ", ".join(p for p in parts if p)
+
+
+def plan_to_text(plan: dict) -> str:
+    """The plan in the plain 📅 format that /today, the checks and the history files use."""
+    lines: list[str] = []
+    if plan["split_explanation"]:
+        lines += [plan["split_explanation"], ""]
+    for day in plan["days"]:
+        lines.append(f"📅 {day['day']}: {day['focus']}")
+        if day["warm_up"]:
+            lines.append("Warm up: " + "; ".join(day["warm_up"]))
+        number = 0
+        for sec in day["sections"]:
+            rehab = "rehab" in sec["body_part"].lower()
+            lines.append(f"{sec['body_part']}:")
+            for ex in sec["exercises"]:
+                number += 1
+                lines.append(f"{number}. {'Rehab: ' if rehab else ''}{ex['name']}: {_dose(ex)}")
+                for label, key in (("Cue", "cue"), ("Left arm", "left_arm"), ("Muscles", "muscles")):
+                    if ex[key]:
+                        lines.append(f"{label}: {ex[key]}")
+                if ex["video"]:
+                    lines.append(f"Video: [yt: {ex['video']}]")
+                if ex["swap"]:
+                    lines.append(f"Swap: {ex['swap']}")
+        if day["cool_down"]:
+            lines.append("Cool down: " + "; ".join(day["cool_down"]))
+        if day["note"]:
+            lines.append(f"Note: {day['note']}")
+        lines.append("")
+    if plan["notes"]:
+        lines.append("📝 Notes")
+        lines += [f"• {note}" for note in plan["notes"]]
+    return "\n".join(lines).strip()
+
+
+BODY_PART_EMOJI = [
+    ("rehab", "🩹"), ("warm", "🔥"), ("cool", "🧊"), ("chest", "🫸"), ("back", "🔙"),
+    ("lat", "🔙"), ("shoulder", "🏋️"), ("arm", "💪"), ("bicep", "💪"), ("tricep", "💪"),
+    ("glute", "🍑"), ("hip", "🍑"), ("leg", "🦵"), ("quad", "🦵"), ("hamstring", "🦵"),
+    ("calf", "🦵"), ("core", "🧱"), ("abs", "🧱"), ("court", "🏀"), ("jump", "🏀"),
+    ("plyo", "🏀"), ("basketball", "🏀"), ("swim", "🏊"), ("run", "🏃"), ("conditioning", "❤️‍🔥"),
+    ("cardio", "❤️‍🔥"), ("mobility", "🧘"), ("full body", "🏋️"),
+]
+
+
+def body_part_emoji(name: str) -> str:
+    lower = name.lower()
+    return next((emoji for word, emoji in BODY_PART_EMOJI if word in lower), "🏋️")
+
+
+def _h(text: str) -> str:
+    return html.escape(text, quote=False)
+
+
+def _dose_html(ex: dict) -> str:
+    parts = [f"<code>{_h(f'{ex['sets']} × {ex['reps']}' if ex['sets'] else ex['reps'])}</code>"]
+    if ex["load"]:
+        parts.append(f"<b>{_h(ex['load'])}</b>")
+    if ex["rest_s"]:
+        rest = ex["rest_s"]
+        parts.append(f"rest {rest // 60} min {rest % 60} s" if rest >= 60 and rest % 60 else
+                     (f"rest {rest // 60} min" if rest >= 60 else f"rest {rest} s"))
+    if ex["effort"]:
+        parts.append(_h(ex["effort"]))
+    return " · ".join(parts)
+
+
+def day_card_blocks(day: dict, subtitle: str = "", when: date | None = None) -> list[str]:
+    """One day's workout as Telegram HTML blocks, grouped by body part."""
+    name = f"{day['day']} {when.day} {when:%b}" if when else day["day"]
+    head = [f"<b>📅 {_h(name)} · {_h(day['focus'])}</b>"]
+    if subtitle:
+        head.append(f"<i>{_h(subtitle)}</i>")
+    sets = sum(ex["sets"] for sec in day["sections"] for ex in sec["exercises"])
+    parts = list(dict.fromkeys(sec["body_part"] for sec in day["sections"]))
+    stats = []
+    if day["minutes"]:
+        stats.append(f"⏱ About {day['minutes']} min")
+    if parts:
+        stats.append("🎯 " + ", ".join(_h(p) for p in parts))
+    if sets and not day["rest_day"]:
+        stats.append(f"{sets} sets")
+    if stats:
+        head.append(" · ".join(stats))
+    if day["note"]:
+        head.append(f"💬 {_h(day['note'])}")
+    blocks = ["\n".join(head)]
+    if day["warm_up"]:
+        blocks.append("<b>🔥 WARM UP</b>\n" + "\n".join(f"• {_h(w)}" for w in day["warm_up"]))
+    number = 0
+    for sec in day["sections"]:
+        title = f"<b>{body_part_emoji(sec['body_part'])} {_h(sec['body_part'].upper())}</b>"
+        if "rehab" in sec["body_part"].lower():
+            title += " <i>(confirm with your physio)</i>"
+        cards = []
+        for ex in sec["exercises"]:
+            number += 1
+            label = ex["superset"] or str(number)
+            lines = [f"<b>{_h(label)} · {_h(ex['name'])}</b>", _dose_html(ex)]
+            details = []
+            if ex["cue"]:
+                details.append(f"💡 {_h(ex['cue'])}")
+            if ex["left_arm"]:
+                details.append(f"🦾 Left arm: {_h(ex['left_arm'])}")
+            if VIDEO_LINK_RE.fullmatch(ex["video"]):  # a real video link: shown with a preview
+                details.append(f'▶️ <a href="{html.escape(ex["video"])}">Form video</a>')
+            elif ex["video"]:
+                details.append(f'▶️ <a href="{html.escape(yt_search_url(ex["video"]))}">Form video: {_h(ex["video"])}</a>')
+            if ex["muscles"]:
+                details.append(f"🎯 {_h(ex['muscles'])}")
+            if ex["tempo"]:
+                details.append(f"🐢 Tempo {_h(ex['tempo'])}")
+            if ex["swap"]:
+                details.append(f"🔁 Swap: {_h(ex['swap'])}")
+            if details:
+                lines.append("<blockquote expandable>" + "\n".join(details) + "</blockquote>")
+            cards.append("\n".join(lines))
+        if cards:  # the title stays with the first card when the day spans two messages
+            blocks += [title + "\n\n" + cards[0], *cards[1:]]
+    if day["cool_down"]:
+        blocks.append("<b>🧊 COOL DOWN</b>\n" + "\n".join(f"• {_h(c)}" for c in day["cool_down"]))
+    if not day["rest_day"] and day["sections"]:
+        blocks.append("📝 Log your weights with /log, then send /done when you finish.")
+    return blocks
+
+
+def week_summary_blocks(plan: dict, title: str, marks: dict[str, str] | None = None) -> list[str]:
+    """The whole week in short: each day's body parts with sets, reps and loads.
+    marks: day name -> ✅ or ⏭ for sessions already done or skipped."""
+    head = f"<b>🗓 {_h(title)}</b>"
+    if plan["split_explanation"]:
+        head += f"\n<blockquote expandable>🧠 {_h(plan['split_explanation'])}</blockquote>"
+    blocks = [head]
+    for day in plan["days"]:
+        top = f"<b>📅 {_h(day['day'])} · {_h(day['focus'])}</b>"
+        if marks and marks.get(day["day"]):
+            top += f" {marks[day['day']]}"
+        if day["minutes"] and day["sections"]:
+            top += f" · ⏱ {day['minutes']} min"
+        lines = [top]
+        for sec in day["sections"]:
+            items = []
+            for ex in sec["exercises"]:
+                dose = f"{ex['sets']}×{ex['reps']}" if ex["sets"] else ex["reps"]
+                load = f" @ {ex['load']}" if re.search(r"\d", ex["load"]) else ""
+                items.append(f"{_h(ex['name'])} {_h(dose)}{_h(load)}")
+            lines.append(f"{body_part_emoji(sec['body_part'])} <b>{_h(sec['body_part'])}</b>: " + " · ".join(items))
+        if not day["sections"] and day["note"]:
+            lines.append(_h(day["note"]))
+        blocks.append("\n".join(lines))
+    if plan["notes"]:
+        blocks.append("<b>📝 Notes</b>\n<blockquote expandable>" + "\n".join(f"• {_h(n)}" for n in plan["notes"]) + "</blockquote>")
+    blocks.append("Send /today for today's full workout, or /day fri for any day.")
+    return blocks
+
+
+def _visible(html_text: str) -> str:
+    return html.unescape(re.sub(r"<[^>]+>", "", html_text))
+
+
+def html_to_plain(html_text: str) -> str:
+    """Card HTML as plain text, with links written out."""
+    text = re.sub(r'<a href="([^"]*)">(.*?)</a>', lambda m: f"{m.group(2)}: {m.group(1)}", html_text)
+    return _visible(text)
+
+
+ENTITY_RE = re.compile(r"<(?:b|i|u|s|code|pre|a|blockquote)[\s>]")
+
+
+def pack_blocks(blocks: list[str], limit: int = 3800) -> list[str]:
+    """Join HTML blocks into messages under Telegram's length limit (and well under its
+    limit on formatted pieces per message)."""
+    messages: list[str] = []
+    current = ""
+    for block in blocks:
+        candidate = f"{current}\n\n{block}" if current else block
+        if (_tg_len(html_to_plain(candidate)) <= limit and len(candidate) <= 3 * limit
+                and len(ENTITY_RE.findall(candidate)) <= 90):
+            current = candidate
+            continue
+        if current:
+            messages.append(current)
+        current = block
+    if current:
+        messages.append(current)
+    return messages
+
+
+async def send_blocks(bot, chat_id: int, blocks: list[str], reply_markup=None) -> list:
+    """Send ready made HTML blocks; plain text if Telegram rejects the HTML."""
+    sent = []
+    messages = pack_blocks(blocks)
+    for i, message in enumerate(messages):
+        markup = reply_markup if i == len(messages) - 1 else None
+        links = [html.unescape(href) for href in re.findall(r'href="([^"]+)"', message)]
+        video = next((link for link in links if VIDEO_LINK_RE.fullmatch(link)), None)
+        preview = LinkPreviewOptions(url=video) if video else LinkPreviewOptions(is_disabled=True)
+        try:
+            msg = await bot.send_message(chat_id, message, parse_mode=ParseMode.HTML,
+                                         link_preview_options=preview, reply_markup=markup)
+        except BadRequest as exc:
+            log.warning("Telegram rejected the HTML (%s), sending plain text", exc)
+            chunks = split_text(html_to_plain(message))
+            for k, chunk in enumerate(chunks):
+                msg = await bot.send_message(chat_id, chunk, link_preview_options=preview,
+                                             reply_markup=markup if k == len(chunks) - 1 else None)
+        sent.append(msg)
+    return sent
+
+
+# ---------------------------------------------------------------------------
 # The coach: context, questions and plans
 # ---------------------------------------------------------------------------
 
@@ -1799,6 +2178,7 @@ class PlanResult:
     meta: dict
     warnings: list[str]
     reused: bool = False  # an existing plan was kept instead of building a new one
+    data: dict | None = None  # the structured plan behind the workout cards
 
 
 class PlanBusy(Exception):
@@ -2091,7 +2471,7 @@ class Coach:
             )
         return problems
 
-    def plan_request(self, monday: date, notes: str) -> str:
+    def plan_request(self, monday: date, notes: str, structured: bool = False) -> str:
         week = self.week_number(monday)
         sunday = monday + timedelta(days=6)
         split = self.split_text()
@@ -2144,12 +2524,23 @@ class Coach:
             ]
         if notes.strip():
             lines += ["", f"My notes for this plan: {notes.strip()}"]
-        preface_rule = ", except the short split comparison" if not split else ""
-        lines += ["", PLAN_FORMAT_RULES.format(preface_rule=preface_rule)]
+        lines += ["", self.format_rules(bool(split), structured)]
         return "\n".join(lines)
 
-    def fix_request(self, text: str, problems: list[str], had_split: bool) -> str:
-        preface_rule = "" if had_split else ", except the short split comparison"
+    @staticmethod
+    def format_rules(had_split: bool, structured: bool) -> str:
+        if structured:
+            return STRUCTURED_RULES.format(
+                split_rule="Leave split_explanation empty." if had_split else
+                "Put the short split comparison, and why you picked this split, in split_explanation."
+            )
+        return PLAN_FORMAT_RULES.format(preface_rule="" if had_split else ", except the short split comparison")
+
+    @staticmethod
+    def plan_json(data: dict) -> str:
+        return json.dumps(data, ensure_ascii=False)
+
+    def fix_request(self, text: str, problems: list[str], had_split: bool, data: dict | None = None) -> str:
         return "\n".join(
             [
                 "Your plan below has problems the bot found:",
@@ -2158,10 +2549,10 @@ class Coach:
                 "Rewrite the full plan. Give a shoulder friendly swap for every movement listed, "
                 "add any missing days, and keep everything else the same.",
                 "",
-                PLAN_FORMAT_RULES.format(preface_rule=preface_rule),
+                self.format_rules(had_split, structured=data is not None),
                 "",
                 "The plan:",
-                text,
+                self.plan_json(data) if data else text,
             ]
         )
 
@@ -2191,13 +2582,38 @@ class Coach:
             if line.strip().upper().startswith("PROBLEM:") and line.split(":", 1)[1].strip()
         ]
 
+    def read_plan_reply(self, reply: str, tidy=None) -> tuple[str, dict | None]:
+        """Claude's plan as (text, data). Data is None when the reply was plain text."""
+        data = normalize_plan(reply) if reply.lstrip().startswith("{") else None
+        if data is None:
+            return clean_reply(reply), None
+        if tidy:
+            data = tidy(data)
+        return plan_to_text(data), data
+
+    async def first_draft(self, system: str, make_request, tidy) -> tuple[str, dict | None]:
+        """The plan as structured data, or in the text format if that fails for a reason
+        other than sign in, limits, the network or time."""
+        if self.cfg.structured_plans:
+            try:
+                reply = await self.runner.run(system, make_request(True), "plan", PLAN_SCHEMA)
+                return self.read_plan_reply(reply, tidy)
+            except ClaudeError as exc:
+                if exc.timed_out or exc.user_message in (MSG_AUTH, MSG_LIMIT, MSG_NETWORK):
+                    raise
+                log.warning("The structured plan failed (%s), asking for the text format", exc)
+        return self.read_plan_reply(await self.runner.run(system, make_request(False), "plan"))
+
     async def generate_plan(
-        self, monday: date, request: str, *, kind: str, save_split: bool, notes: str = ""
+        self, monday: date, make_request, *, kind: str, save_split: bool, notes: str = "", tidy=None
     ) -> PlanResult:
-        """Run Claude, check the plan (rules, then a safety review), fix it once if needed, save it."""
+        """Run Claude, check the plan (rules, then a safety review), fix it once if needed, save it.
+
+        make_request(structured) -> the request, for the structured or the text format.
+        tidy(data) -> data adjusts a structured plan before the checks, like keeping past days."""
         had_split = bool(self.store.state().get("split"))
         system = self.system_prompt(planning=monday)
-        text = clean_reply(await self.runner.run(system, request, "plan"))
+        text, data = await self.first_draft(system, make_request, tidy)
         problems = self.plan_problems(text)
         reviewed: list[str] = []
         if self.cfg.safety_review and self.cfg.blocked_movements:
@@ -2211,13 +2627,16 @@ class Coach:
         if problems:
             log.info("Plan for %s has %d problems, asking Claude to fix it once", monday, len(problems))
             try:
-                candidate = clean_reply(
-                    await self.runner.run(system, self.fix_request(text, problems, had_split), "plan")
+                candidate, candidate_data = self.read_plan_reply(
+                    await self.runner.run(
+                        system, self.fix_request(text, problems, had_split, data), "plan", PLAN_SCHEMA if data else None
+                    ),
+                    tidy,
                 )
                 if len(parse_plan(candidate).missing_days) <= len(parse_plan(text).missing_days) and len(
                     self.plan_problems(candidate)
                 ) <= len(problems):
-                    text, fixed = candidate, True
+                    text, data, fixed = candidate, candidate_data, True
                 else:
                     warnings.append("Claude's fixed version was worse, so I kept the first version.")
             except ClaudeError as exc:
@@ -2238,8 +2657,9 @@ class Coach:
             "fixed_once": fixed,
             "safety_review": reviewed,
             "warnings": warnings,
+            "structured": data is not None,
         }
-        self.store.save_plan(monday, text, meta, now.strftime("%Y%m%d-%H%M%S"))
+        self.store.save_plan(monday, text, meta, now.strftime("%Y%m%d-%H%M%S"), data)
         state_update: dict[str, Any] = {
             "last_plan_built": {"at": meta["built_at"], "monday": monday.isoformat(), "kind": kind}
         }
@@ -2247,7 +2667,7 @@ class Coach:
         if save_split and len(parsed.days) == 7:
             state_update["split"] = {str(i): d.focus for i, d in sorted(parsed.days.items())}
         self.store.update_state(**state_update)
-        return PlanResult(monday, text, meta, warnings)
+        return PlanResult(monday, text, meta, warnings, data=data)
 
     async def build_week(
         self, monday: date, notes: str = "", *, kind: str = "build", wait: bool = False, keep_if=None
@@ -2261,14 +2681,17 @@ class Coach:
             if existing and keep_if is not None:
                 meta = self.store.load_plan_meta(monday)
                 if keep_if(meta):
-                    return PlanResult(monday, existing, meta, meta.get("warnings", []), reused=True)
+                    return PlanResult(monday, existing, meta, meta.get("warnings", []), reused=True,
+                                      data=self.store.load_plan_data(monday))
             if not self.program_start():
                 self.store.update_state(program_start=monday.isoformat())
             week = self.week_number(monday)
             state = self.store.state()
             save_split = not state.get("split") or week == 1 or "split" in notes.lower()
-            request = self.plan_request(monday, notes)
-            return await self.generate_plan(monday, request, kind=kind, save_split=save_split, notes=notes)
+            return await self.generate_plan(
+                monday, lambda structured: self.plan_request(monday, notes, structured),
+                kind=kind, save_split=save_split, notes=notes,
+            )
 
     async def adjust_after_skip(self, day: date) -> PlanResult | None:
         """Rewrite the rest of the week after a skipped session, without doubling up.
@@ -2287,22 +2710,40 @@ class Coach:
             focus = today_plan.focus if today_plan else "today's session"
             kept = "Monday" if upto == 0 else f"Monday to {DAY_NAMES[upto]}"
             which = "today's session" if upto == wd else f"{DAY_NAMES[wd]}'s session"
-            request = "\n".join(
-                [
-                    f"I skipped {which} ({DAY_NAMES[wd]}: {focus}).",
-                    f"Adjust the rest of this week, {DAY_NAMES[upto + 1]} to Sunday, following your "
-                    "rules: do not double up, keep what matters most, and keep my shoulder safe.",
-                    f"Keep {kept} exactly as written, but add (skipped) at the end of the "
-                    f"{DAY_NAMES[wd]} line.",
-                    "Keep this week's main equipment and effort. Return the full week.",
-                    "",
-                    PLAN_FORMAT_RULES.format(preface_rule=""),
-                    "",
-                    "This week's plan:",
-                    plan,
-                ]
+            data = self.store.load_plan_data(monday)
+
+            def request(structured: bool) -> str:
+                where = f"{DAY_NAMES[wd]} focus" if structured else f"{DAY_NAMES[wd]} line"
+                return "\n".join(
+                    [
+                        f"I skipped {which} ({DAY_NAMES[wd]}: {focus}).",
+                        f"Adjust the rest of this week, {DAY_NAMES[upto + 1]} to Sunday, following your "
+                        "rules: do not double up, keep what matters most, and keep my shoulder safe.",
+                        f"Keep {kept} exactly as written, but add (skipped) at the end of the {where}.",
+                        "Keep this week's main equipment and effort. Return the full week.",
+                        "",
+                        self.format_rules(True, structured),
+                        "",
+                        "This week's plan:",
+                        self.plan_json(data) if structured and data else plan,
+                    ]
+                )
+
+            def keep_past(new: dict) -> dict:
+                """Days up to today stay exactly as they were; the skipped day is marked."""
+                old = {DAY_LOOKUP[d["day"].lower()]: d for d in data["days"]}
+                days = {DAY_LOOKUP[d["day"].lower()]: d for d in new["days"]}
+                for i in range(upto + 1):
+                    if i in old:
+                        days[i] = dict(old[i])
+                if wd in days and "skipped" not in days[wd]["focus"].lower():
+                    days[wd] = {**days[wd], "focus": days[wd]["focus"] + " (skipped)"}
+                return {**new, "days": [days[i] for i in sorted(days)],
+                        "split_explanation": data.get("split_explanation", "")}
+
+            return await self.generate_plan(
+                monday, request, kind="adjusted", save_split=False, tidy=keep_past if data else None
             )
-            return await self.generate_plan(monday, request, kind="adjusted", save_split=False)
 
     def capture_checkin(self, message) -> str | None:
         """Save a reply to the Sunday check in, or the next message before the plan time."""
@@ -2362,44 +2803,109 @@ class Coach:
             return f"🔑 Your Claude Code token probably expired on {fmt_day(expires)}. {steps}"
         return f"🔑 Your Claude Code token expires in {left} days, on {fmt_day(expires)}. {steps}"
 
-    # -- plain views ----------------------------------------------------------
+    # -- views: workout cards for structured plans, text for older plans ------
 
-    def today_text(self) -> str:
-        today = self.today()
-        monday = monday_of(today)
-        plan = self.store.load_plan(monday)
+    def day_status_lines(self, day: date) -> list[str]:
+        lines = [line for line in [self.day_off_line(day)] if line]
+        when = "today" if day == self.today() else f"on {DAY_NAMES[day.weekday()]}"
+        if when != "today":
+            lines = [line.replace(" today", f" {when}") for line in lines]
+        status = self.store.sessions().get(day.isoformat(), {}).get("status")
+        if status == "done":
+            lines.append(f"✅ Already marked done {when}.")
+        if status == "skipped":
+            lines.append(f"⏭ Marked as skipped {when}.")
+        return lines
+
+    def day_view(self, day: date, heading: str = "", notes: list[str] | None = None) -> list[str] | None:
+        """The day's workout card (HTML blocks), or None when the week has no structured plan."""
+        monday = monday_of(day)
+        data = self.store.load_plan_data(monday)
+        entry = next((d for d in data["days"] if d["day"] == DAY_NAMES[day.weekday()]), None) if data else None
+        if entry is None:
+            return None
+        top = ([f"**{heading}**"] if heading else []) + self.day_status_lines(day) + (notes or [])
+        blocks = [to_html("\n".join(top))] if top else []
+        return blocks + day_card_blocks(entry, self.week_label(monday), day)
+
+    def day_text(self, day: date) -> str:
+        plan = self.store.load_plan(monday_of(day))
         if not plan:
             return "No plan is saved for this week yet. Send /plan to build one."
-        day = parse_plan(plan).days.get(today.weekday())
-        if not day:
+        found = parse_plan(plan).days.get(day.weekday())
+        if not found:
             return (
-                f"I could not find {DAY_NAMES[today.weekday()]} in this week's plan, so here is "
+                f"I could not find {DAY_NAMES[day.weekday()]} in the plan, so here is "
                 f"the whole week.\n\n{plan}"
             )
-        status = self.store.sessions().get(today.isoformat(), {}).get("status")
-        prefix = [line for line in [self.day_off_line(today)] if line]
-        if status == "done":
-            prefix.append("✅ Already marked done today.")
-        if status == "skipped":
-            prefix.append("⏭ Marked as skipped today.")
-        return "\n".join(prefix) + "\n\n" + day.text if prefix else day.text
+        prefix = self.day_status_lines(day)
+        return "\n".join(prefix) + "\n\n" + found.text if prefix else found.text
 
-    def week_text(self) -> str:
+    def today_text(self) -> str:
+        return self.day_text(self.today())
+
+    def today_view(self) -> str | list[str]:
+        return self.day_view(self.today()) or self.today_text()
+
+    def upcoming(self, weekday: int) -> date:
+        """That weekday this week, or next week's once it has passed and next week is built."""
+        today = self.today()
+        day = monday_of(today) + timedelta(days=weekday)
+        if day < today and self.store.load_plan(monday_of(today) + timedelta(days=7)):
+            day += timedelta(days=7)
+        return day
+
+    def any_day_view(self, weekday: int) -> str | list[str]:
+        day = self.upcoming(weekday)
+        return self.day_view(day) or self.day_text(day)
+
+    def week_to_show(self) -> tuple[date, str]:
+        """This week's Monday, or next week's on weekends once it is built, plus a note."""
         today = self.today()
         monday = monday_of(today)
-        note = ""
         if today.weekday() >= 5:
             nxt = monday + timedelta(days=7)
             if self.store.load_plan(nxt):
-                monday = nxt
-            else:
-                note = (
-                    "Next week's plan is not built yet. It gets built on Sunday at "
-                    f"{self.cfg.plan_time:%H:%M} after your check in, or send /nextweek to build it now."
-                )
+                return nxt, ""
+            return monday, (
+                "Next week's plan is not built yet. It gets built on Sunday at "
+                f"{self.cfg.plan_time:%H:%M} after your check in, or send /nextweek to build it now."
+            )
+        return monday, ""
+
+    def week_marks(self, monday: date) -> dict[str, str]:
+        sessions = self.store.sessions()
+        marks = {}
+        for i in range(7):
+            status = sessions.get((monday + timedelta(days=i)).isoformat(), {}).get("status")
+            if status in ("done", "skipped"):
+                marks[DAY_NAMES[i]] = "✅" if status == "done" else "⏭"
+        return marks
+
+    def week_view(self) -> str | list[str]:
+        monday, note = self.week_to_show()
+        data = self.store.load_plan_data(monday)
+        if not data:
+            return self.week_text()
+        blocks = week_summary_blocks(data, self.week_label(monday), self.week_marks(monday))
+        if note:
+            blocks.insert(0, to_html(f"{note} Here is this week's plan until then."))
+        return blocks
+
+    def plan_view(self, result: PlanResult) -> str | list[str]:
+        """The reply after /plan or /nextweek."""
+        if not result.data:
+            return self.plan_reply(result)
+        blocks = week_summary_blocks(result.data, self.week_label(result.monday))
+        if result.warnings:
+            blocks.insert(-1, to_html("⚠️ Please check:\n" + "\n".join(f"• {w}" for w in result.warnings)))
+        return blocks
+
+    def week_text(self) -> str:
+        monday, note = self.week_to_show()
         plan = self.store.load_plan(monday)
         if not plan:
-            return "No plan is saved for this week yet. Send /plan to build one." + note
+            return "No plan is saved for this week yet. Send /plan to build one." + (f" {note}" if note else "")
         if note:
             return f"{note.strip()} Here is this week's plan until then.\n\n**{self.week_label(monday)}**\n\n{plan.strip()}"
         return f"**{self.week_label(monday)}**\n\n{plan.strip()}"
@@ -2412,6 +2918,18 @@ class Coach:
         return text
 
     def overview(self, result: PlanResult, heading: str, start: int = 0) -> str:
+        if result.data:
+            lines = [heading, ""]
+            for day in result.data["days"]:
+                idx = DAY_LOOKUP[day["day"].lower()]
+                if idx < start:
+                    continue
+                lines.append(f"📅 {day['day'][:3]}: {day['focus']}")
+                for sec in day["sections"]:
+                    names = ", ".join(ex["name"] for ex in sec["exercises"])
+                    lines.append(f"{body_part_emoji(sec['body_part'])} {sec['body_part']}: {names}")
+                lines.append("")
+            return "\n".join(lines).strip()
         parsed = parse_plan(result.text)
         lines = [heading, ""]
         for idx in range(start, 7):
@@ -2439,8 +2957,9 @@ class Coach:
 
 COMMANDS = [
     ("ask", "Ask your coach anything"),
-    ("today", "Today's session"),
+    ("today", "Today's workout"),
     ("week", "This week's plan (next week's on weekends)"),
+    ("day", "Any day's workout, like /day fri"),
     ("plan", "Rebuild this week's plan, with optional notes"),
     ("nextweek", "Build next week's plan now"),
     ("log", "Log what you did"),
@@ -2458,7 +2977,7 @@ COMMANDS = [
 HELP_TEXT = """Hi, I am your gym coach.
 
 • Just write to me, or use /ask, with any training question.
-• /today shows today's session and /week the whole week.
+• /today shows today's workout, /day fri any day's, and /week the whole week.
 • /plan rebuilds this week and /nextweek builds next week. Add notes after the command.
 • /log what you did, then /done when you finish a session.
 • /shoulder shows your shoulder ratings, /injury your injury notes.
@@ -2476,8 +2995,15 @@ def args_text(update: Update) -> str:
     return parts[1].strip() if len(parts) > 1 else ""
 
 
-async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None):
-    return await send_text(context.bot, update.effective_chat.id, text, reply_markup=reply_markup)
+async def send_view(bot, chat_id: int, view: str | list[str], reply_markup=None) -> list:
+    """Text goes through the Markdown to HTML path; a list is ready made HTML blocks."""
+    if isinstance(view, list):
+        return await send_blocks(bot, chat_id, view, reply_markup=reply_markup)
+    return await send_text(bot, chat_id, view, reply_markup=reply_markup)
+
+
+async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str | list[str], reply_markup=None):
+    return await send_view(context.bot, update.effective_chat.id, text, reply_markup=reply_markup)
 
 
 async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2748,11 +3274,20 @@ async def on_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await reply(update, context, coach_of(context).today_text())
+    await reply(update, context, coach_of(context).today_view())
+
+
+async def cmd_day(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    arg = args_text(update).lower().strip(" .")
+    weekday = DAY_LOOKUP.get(arg)
+    if weekday is None:
+        await reply(update, context, "Which day? Send /day and a day, like /day fri or /day monday.")
+        return
+    await reply(update, context, coach_of(context).any_day_view(weekday))
 
 
 async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await reply(update, context, coach_of(context).week_text())
+    await reply(update, context, coach_of(context).week_view())
 
 
 async def _build_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, monday: date, label: str) -> None:
@@ -2772,7 +3307,7 @@ async def _build_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, m
     except ClaudeError as exc:
         await reply(update, context, f"I could not build the plan. {exc.user_message}")
         return
-    await reply(update, context, coach.plan_reply(result))
+    await reply(update, context, coach.plan_view(result))
 
 
 async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3025,6 +3560,7 @@ def add_handlers(application: Application, concurrent: bool = True) -> None:
     application.add_handler(CommandHandler("ask", cmd_ask, **slow))
     application.add_handler(CommandHandler("today", cmd_today))
     application.add_handler(CommandHandler("week", cmd_week))
+    application.add_handler(CommandHandler("day", cmd_day))
     application.add_handler(CommandHandler("plan", cmd_plan, **slow))
     application.add_handler(CommandHandler("nextweek", cmd_nextweek, **slow))
     application.add_handler(CommandHandler("log", cmd_log))
@@ -3082,12 +3618,12 @@ def ptb_days(days: list[int]) -> tuple[int, ...]:
     return tuple(sorted((d + 1) % 7 for d in days))
 
 
-async def owner_send(context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None) -> list:
+async def owner_send(context: ContextTypes.DEFAULT_TYPE, text: str | list[str], reply_markup=None) -> list:
     coach = coach_of(context)
     if coach.cfg.owner_id is None:
         log.warning("No ALLOWED_USER_IDS, so reminders have nowhere to go")
         return []
-    return await send_text(context.bot, coach.cfg.owner_id, text, reply_markup=reply_markup)
+    return await send_view(context.bot, coach.cfg.owner_id, text, reply_markup=reply_markup)
 
 
 def alt_keyboard(day: date) -> InlineKeyboardMarkup:
@@ -3131,6 +3667,12 @@ async def send_day_session(context: ContextTypes.DEFAULT_TYPE, heading: str, res
             await owner_send(context, f"This week has no plan and I could not build one. {exc.user_message} Send /plan to try again.")
             return
     day = parse_plan(coach.store.load_plan(monday) or "").days.get(today.weekday())
+    rest = bool(day and day.is_rest)
+    note = coach.recovery_note(today, rest_day=rest)
+    cards = coach.day_view(today, rest_heading if rest else heading, [note] if note else None) if day else None
+    if cards:
+        await owner_send(context, cards, reply_markup=None if rest else alt_keyboard(today))
+        return
     markup = None
     if day is None:
         text = coach.today_text()
@@ -3142,7 +3684,6 @@ async def send_day_session(context: ContextTypes.DEFAULT_TYPE, heading: str, res
     off = coach.day_off_line(today)
     if off and day is not None:
         text = f"{off}\n{text}"
-    note = coach.recovery_note(today, rest_day=bool(day and day.is_rest))
     if note:
         text += "\n\n" + note
     await owner_send(context, text, reply_markup=markup)

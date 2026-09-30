@@ -4,6 +4,10 @@
 Records every call to $FAKE_CLAUDE_LOG (JSON lines). Behaviour per call comes from the
 first entry of $FAKE_CLAUDE_QUEUE (a JSON list file, entries are popped) or from
 $FAKE_CLAUDE_MODE. Modes: ok, error, auth, limit, maxturns, nonjson, sleep, list.
+
+Plan calls with --json-schema get a text reply (like a Claude Code without structured
+output) unless $FAKE_CLAUDE_STRUCTURED=1 or the queue entry has "structured" (true for
+the built in plan, or the exact data to return).
 """
 import json
 import os
@@ -118,6 +122,76 @@ def make_plan(text):
     return "\n".join(lines)
 
 
+def _after(marker, text):
+    """The JSON plan that follows a marker line in the request."""
+    if marker not in text:
+        return None
+    try:
+        return json.loads(text.split(marker, 1)[1].strip().splitlines()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def exercise(name, sets=3, reps="10", load="12.5 kg", rest=90, **extra):
+    item = {"name": name, "sets": sets, "reps": reps, "load": load, "rest_s": rest, "effort": "RPE 7",
+            "tempo": "3-1-1", "muscles": "chest & front delts", "cue": "Elbows < 45 degrees, ribs down",
+            "left_arm": "", "video": f"{name} proper form", "swap": "Push up on the bench", "superset": ""}
+    item.update(extra)
+    return item
+
+
+def make_structured(text):
+    fixing = _after("The plan:", text) if "Your plan below has problems" in text else None
+    adjusting = _after("This week's plan:", text) if "I skipped" in text else None
+    base = fixing or adjusting
+    if base:
+        base["notes"] = list(base.get("notes") or []) + (["FIXED"] if fixing else ["ADJUSTED"])
+        if adjusting:  # rewrite every day, the bot keeps the past ones itself
+            for day in base["days"]:
+                day["note"] = "Adjusted after the skip."
+        return base
+    week = re.search(r"Week number: (\d+)", text)
+    week = int(week.group(1)) if week else 0
+    equip = re.search(r"Main equipment this week: ([^.\n]+)", text)
+    equip = equip.group(1).strip() if equip else "mixed"
+    split = dict(DEFAULT_SPLIT)
+    for day in DAYS:
+        m = re.search(rf"^{day}: (.+)$", text, re.M)
+        if m and "Keep my split" in text:
+            split[day] = m.group(1).strip()
+    days = []
+    for d, day in enumerate(DAYS):
+        focus = split[day]
+        if focus.startswith("Rest"):
+            days.append({"day": day, "focus": focus, "rest_day": True, "minutes": 20, "warm_up": [],
+                         "sections": [{"body_part": "Mobility", "exercises": [
+                             exercise("Cat cow", 2, "10", "bodyweight", 0)]}],
+                         "cool_down": [], "note": "Walk 30 minutes and stretch."})
+            continue
+        name = lambda k: f"{equip.title()} move W{week} D{d + 1} N{k}"
+        if day == "Friday":
+            sections = [
+                {"body_part": "Swim", "exercises": [exercise("Easy freestyle", 1, "20 min", "easy pace", 0)]},
+                {"body_part": "Legs (if you do not swim)", "exercises": [exercise(name(1), superset="A1"),
+                                                                         exercise(name(2), superset="A2")]},
+                {"body_part": "Run", "exercises": [exercise("Easy run", 1, "3 km", "6:00 per km", 0)]},
+            ]
+        else:
+            sections = [
+                {"body_part": "Chest", "exercises": [exercise(name(1), left_arm="Light, 5 kg, stop if it hurts")]},
+                {"body_part": "Arms", "exercises": [exercise(name(2), 2, "12", "7.5 kg", 60)]},
+                {"body_part": "Shoulder rehab", "exercises": [exercise("Band external rotation", 2, "15", "light band", 30)]},
+            ]
+        days.append({"day": day, "focus": focus, "rest_day": False, "minutes": 55,
+                     "warm_up": ["5 minutes easy bike", "Band pull aparts, 2 x 15"], "sections": sections,
+                     "cool_down": ["5 minutes stretching"], "note": ""})
+    return {
+        "split_explanation": "Push/pull suits your shoulder and basketball best." if "first week" in text else "",
+        "days": days,
+        "notes": ["Sleep 7 hours, protein about 125 g a day.", "Confirm the rehab block with your physio."],
+    }
+
+
 def emit(obj, code=0):
     print(json.dumps(obj))
     sys.exit(code)
@@ -138,6 +212,9 @@ if mode == "auth":
     emit({"type": "result", "subtype": "success", "is_error": True, "result": "Invalid API key · Please run /login"}, 1)
 if mode == "limit":
     emit({"type": "result", "subtype": "success", "is_error": True, "result": "Claude AI usage limit reached|1760000000"}, 1)
+if mode == "structured_fail":
+    emit({"type": "result", "subtype": "error_max_structured_output_retries", "is_error": True, "num_turns": 3,
+          "errors": ["Failed to provide valid structured output after 5 attempts"]}, 1)
 if mode == "maxturns":
     emit({"type": "result", "subtype": "error_max_turns", "is_error": False, "num_turns": 11})
 
@@ -157,6 +234,10 @@ else:
     )
 payload = {"type": "result", "subtype": "success", "is_error": False, "result": result,
            "num_turns": 1, "total_cost_usd": 0.01, "session_id": "fake"}
+structured = entry.get("structured", os.environ.get("FAKE_CLAUDE_STRUCTURED") == "1" and "result" not in entry)
+if flag("--json-schema") and structured:
+    payload.update(result="", num_turns=2,
+                   structured_output=structured if isinstance(structured, dict) else make_structured(stdin))
 if mode == "list":
     print(json.dumps([{"type": "system"}, payload]))
     sys.exit(0)
