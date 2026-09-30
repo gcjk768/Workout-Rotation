@@ -311,3 +311,11 @@ async def test_self_repair_off_still_tells_the_owner(env, clock, claude):
         assert tg.texts()[-1].endswith("The details are saved in data/errors.jsonl.")
     finally:
         await app.shutdown()
+
+
+async def test_what_i_did_for_a_code_bug(app, claude, clock):
+    repair = app.bot_data["repair"]
+    done, _ = await repair.apply({"remedy": "none", "code_fix": "Guard it."}, None)
+    assert done == "Nothing. I can't fix this on my own; it needs the code change below."
+    done, _ = await repair.apply({"remedy": "none", "code_fix": ""}, None)
+    assert done == "Nothing. It looks like a one off, so there is nothing to fix."
