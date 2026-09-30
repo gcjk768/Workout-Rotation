@@ -293,3 +293,8 @@ async def test_status_hides_internal_jobs(app):
         await app.job_queue.stop()
     assert "heartbeat" not in status and "catch up" not in status
     assert "Daily workout" in status
+
+
+def test_sparkline_ends_at_last_week_when_this_week_is_empty(coach, clock):
+    coach.store.add_rating(date(2026, 9, 29), coach.now(), 2, "")
+    assert bot.weekly_sparkline(coach.store.ratings(), date(2026, 10, 5), weeks=2).startswith("·▂")
