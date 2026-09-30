@@ -50,6 +50,7 @@ jobs:
           CLAUDE_TOKEN_CREATED=2026-01-15
           TELEGRAM_BASE_URL=http://127.0.0.1:8090
           CLAUDE_BIN=/fake/claude
+          FAKE_CLAUDE_STRUCTURED=1
           EOF
           python tests/e2e_scenario.py --serve 8090 > scenario.log 2>&1 &
           docker run -d --name coach --network host --env-file bot.env \

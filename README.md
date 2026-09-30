@@ -71,8 +71,9 @@ In the JSON reply, `"is_error": false` and a `result` text mean everything works
 | Command | What it does |
 |---|---|
 | `/ask <question>` | Ask the coach. In a private chat, a plain message works too. It remembers your last 6 questions. |
-| `/today` | Today's session from this week's plan |
-| `/week` | This week's plan (on Saturday and Sunday, next week's if it's built) |
+| `/today` | Today's workout card (see "Workout cards" below) |
+| `/day <day>` | Any day's workout card, for example `/day fri`. Once a day has passed and next week is built, it shows next week's. |
+| `/week` | The week in short: each day's body parts with sets, reps and weights. On Saturday and Sunday it shows next week's if it's built. |
 | `/plan [notes]` | Rebuild this week's plan with your notes, for example `/plan travelling Thu and Fri` |
 | `/nextweek [notes]` | Build next week's plan now |
 | `/log <what you did>` | Save it with today's date, for example `/log rows 22kg 3x10, floor press 14kg 3x8 felt easy`. `/log` alone lists the last 2 weeks. |
@@ -87,6 +88,41 @@ In the JSON reply, `"is_error": false` and a `result` text mean everything works
 | `/whoami` | Your Telegram user ID |
 
 Shoulder ratings: 0 means no pain and 10 means the worst pain, so a rising trend means the shoulder is getting worse.
+
+## Workout cards
+
+Each day's workout is laid out the way trainers and apps like Strong and Hevy show a session. It follows the usual order: warm up, main lifts, accessories, rehab and conditioning, then cool down.
+
+```
+📅 Thursday 1 Oct · Upper body and rehab
+Week 1 · dumbbells · building week 1 of 3
+⏱ About 55 min · 🎯 Back, Chest, Arms, Shoulder rehab · 16 sets
+
+🔥 WARM UP
+• 5 min easy row
+• Band pull aparts, 2 x 15
+
+🔙 BACK
+
+1 · Single arm dumbbell row
+3 × 10 · 16 kg · rest 1 min 30 s · RPE 7
+ ▸ 💡 Pull the elbow to the hip, no shrug          (tap to expand)
+   🦾 Left arm: 6 kg, stop at any pain
+   ▶️ Form video: single arm dumbbell row proper form
+   🎯 Lats, mid back, rear delts · 🐢 Tempo 2-1-2 · 🔁 Swap: chest supported row
+
+🫸 CHEST
+...
+🩹 SHOULDER REHAB (confirm with your physio)
+...
+🧊 COOL DOWN
+```
+
+- Exercises are grouped by body part, and each one shows sets × reps, the weight, the rest and the effort (RPE).
+- The cue, left arm note, form video, target muscles, tempo and a shoulder friendly swap sit in a collapsed quote. Tap it to open.
+- Supersets are labelled A1 and A2.
+- Friday shows the swim, the legs option and the run as separate sections.
+- The same cards arrive with the 07:00 message and the pre-gym reminder, followed by the Lighter and 30 minute buttons.
 
 ## Reminders (Singapore time, set in `bot.env`)
 
@@ -109,7 +145,7 @@ If the bot was off at a reminder time, it catches up when it starts. It sends a 
   - Every call uses `--output-format json --no-session-persistence --permission-mode dontAsk --model <model>`.
   - The system prompt comes from `--system-prompt-file` and your message goes in on stdin.
   - Questions add `--tools WebSearch --allowedTools WebSearch --max-turns 10` and time out after 4 minutes.
-  - Plans add `--tools "" --max-turns 3` and time out after 10 minutes.
+  - Plans add `--tools "" --max-turns 3` and time out after 10 minutes. They also add `--json-schema`, so Claude returns the week as data: days, body part sections and exercises with sets, reps, weight, rest, effort, tempo, muscles, cue, left arm note, video and swap.
   - The safety review uses the same no-tools flags with `CLAUDE_MODEL_CHECK` (haiku by default).
   - A brief failure (Claude overloaded, a server error or a network blip) is retried once after 5 seconds. Sign-in problems and usage limits are not.
   - `--bare` is never used, because bare mode ignores the subscription token.
@@ -119,8 +155,11 @@ If the bot was off at a reminder time, it catches up when it starts. It sends a 
   - your logged weights per exercise, and the latest check-in;
   - days away or public holidays in the next two weeks;
   - 7 days of Garmin data.
-- **Plans.** Each plan is saved as `data/plans/<Monday>.md`, with a `.json` file next to it that records the week number, equipment, effort and any warnings.
-  - Each day starts with a line like `📅 Monday: Push`, which is how `/today` finds the right day.
+- **Plans.** Each plan is saved as `data/plans/<Monday>.md`, which is a readable text version, plus two files next to it:
+  - `<Monday>.plan.json` holds the plan data behind the workout cards;
+  - `<Monday>.json` records the week number, equipment, effort and any warnings.
+  - Each day in the text version starts with a line like `📅 Monday: Push`. The injury check, the safety review and the no-repeat list all read that text.
+  - If Claude can't return the plan as data, the bot asks once more for the text format, and `/today` shows that text instead of a card. `STRUCTURED_PLANS=off` always uses the text format.
   - The split chosen in week 1 is saved and sent back to Claude every week.
   - Exercises from the two previous weeks are listed so none repeat. Rehab exercises may repeat.
 - **Injury check.** Every line of every day is checked for movements your injury rules leave out, including warm-ups, finishers, options and text in brackets. Lines that only list what to avoid ("no overhead pressing, dips or upright rows") and swaps ("landmine press instead of overhead press") are not flagged. The built-in lists live in `bot.py`, so they improve with updates. Add your own with `INJURY_EXTRA_BLOCKED` and `INJURY_EXTRA_ALLOWED`, and set `INJURY_CHECK=off` once your physio clears you.

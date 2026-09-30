@@ -125,6 +125,7 @@ def base_env(tmp_path: Path) -> dict[str, str]:
         "BASKETBALL_DAYS": "",
         "CLAUDE_RETRY_DELAY": "0",
         "SAFETY_REVIEW": "off",  # tests that need it turn it on
+        "STRUCTURED_PLANS": "off",  # the text format; test_workout_cards.py covers structured plans
     }
 
 
