@@ -2876,6 +2876,8 @@ class Coach:
         if new is None:
             return None
         new["day"] = name
+        if focus:  # the same session, lighter or shorter; the card's subtitle says which
+            new["focus"] = focus
         return new, question, problems
 
     def capture_checkin(self, message) -> str | None:
