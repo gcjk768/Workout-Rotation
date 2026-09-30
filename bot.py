@@ -3967,7 +3967,9 @@ class SelfRepair:
             if sum(1 for t in starts if now - t < timedelta(hours=6)) >= 3:
                 return "Nothing. I already restarted 3 times in 6 hours, so a restart will not help.", False
             return "I am restarting. I will be back within a minute.", True
-        return "Nothing needed changing.", False
+        if result.get("code_fix", "").strip():
+            return "Nothing. I can't fix this on my own; it needs the code change below.", False
+        return "Nothing. It looks like a one off, so there is nothing to fix.", False
 
     # -- the self check every 30 minutes --------------------------------------
 
