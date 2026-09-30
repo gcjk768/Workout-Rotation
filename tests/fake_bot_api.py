@@ -80,6 +80,8 @@ class FakeBotAPI:
     def stop(self) -> None:
         if self._server:
             self._server.shutdown()
+            self._server.server_close()
+            self._server = None
 
     def handle(self, path: str, params: dict) -> tuple[int, dict]:
         prefix = f"/bot{self.token}/"

@@ -5,6 +5,7 @@ services:
     container_name: gym-coach-bot
     restart: unless-stopped
     init: true   # reaps helper processes that claude -p leaves behind
+    stop_grace_period: 30s   # time to finish a reply before `docker compose down` stops it
     env_file: bot.env
     volumes:
       # Plans, logs, shoulder ratings, check ins and chat memory. Include it in your NAS backups.

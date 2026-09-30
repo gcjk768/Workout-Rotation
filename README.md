@@ -5,7 +5,7 @@ A private Telegram bot that coaches you like a personal trainer. It runs in Dock
 - Answers training questions (`/ask`, or just write to it), with web search for real videos.
 - Builds a full 7-day plan every week. The split stays the same while the exercises change. The main equipment rotates (dumbbells, cables, machines, barbell and kettlebells). Effort follows a 4-week wave: three building weeks, then a deload.
 - Protects your left shoulder. Every new plan is checked for movements your injury rules leave out. If one slips in, Claude fixes the plan once before it's saved.
-- Reminds you before the gym and checks at 9pm whether you trained. On Sunday it asks how the week went, then builds next week's plan from your answer.
+- Sends that day's workout every morning, with buttons for a lighter or a 30-minute version. It reminds you again before the gym and checks at 9pm whether you trained. On Sunday it asks how the week went, then builds next week's plan from your answer.
 - Reads your sleep, resting heart rate, HRV, body battery and runs from your garmin-monitor app, and warns you when your recovery looks low.
 
 ## Files
@@ -83,11 +83,14 @@ Shoulder ratings: 0 means no pain and 10 means the worst pain, so a rising trend
 
 | When | What |
 |---|---|
-| Mon to Thu 17:30, Fri 17:00 | Today's session, with a warning if Garmin shows poor recovery |
+| Every day 07:00 | That day's workout, or that it's a rest day, with your Garmin recovery from last night. Workout days get 🪶 **Lighter version** and ⏱ **30 minute version** buttons, which ask the coach to rewrite the session. |
+| Mon to Thu 17:30, Fri 17:00 | Today's session again before the gym, with a warning if Garmin shows poor recovery |
 | 21:00 on training days | "Did you train today?" with Done and Skipped buttons, unless you already sent `/done`. **Skipped** rewrites the rest of the week so you don't double up. The old version is kept in `data/plans/history/`. |
 | Sunday 18:00 | Check-in: energy, soreness, shoulder. Your reply to that message, or your next message before 20:00, is saved. |
 | Sunday 20:00 | Builds next week's plan from your check-in (or without one) and sends an overview with your shoulder trend |
 | Daily 10:00 | From 30 days before your Claude token expires: a reminder to run `claude setup-token` again |
+
+Leave a time empty in `bot.env` (for example `CHECK_TIME=`) to turn that reminder off. `DAILY_WORKOUT_DAYS` picks the days for the morning message.
 
 If the bot was off at a reminder time, it catches up when it starts. It sends a missed Sunday check-in, or builds next week's or this week's missing plan.
 
@@ -131,5 +134,12 @@ The tests need no real tokens and no network. A fake `claude` in `tests/bin`, a 
 pip install -r requirements.txt pytest pytest-asyncio
 python -m pytest
 ```
+
+`tests/test_e2e_process.py` starts the real `python bot.py` process against a stand-in Bot API (`tests/fake_bot_api.py`). It long-polls, sends commands and presses buttons, then stops the bot with SIGTERM the way Docker does. You can run the same scenario against a running container:
+
+1. Start the stand-in: `python tests/e2e_scenario.py --serve 8090`
+2. Point the bot at it: set `TELEGRAM_BASE_URL=http://127.0.0.1:8090` and run the container with host networking.
+
+`TELEGRAM_BASE_URL` is empty in normal use, which means api.telegram.org.
 
 To try the Garmin summary with sample data: `python tests/sample_garmin.py /tmp/monitor.db 2026-09-30`.
