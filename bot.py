@@ -1882,6 +1882,13 @@ STRUCTURED_RULES = """How to fill in the plan. The bot lays it out for Telegram,
 8. The video field holds only the search words, without [yt: ]. Write no dashes; use commas instead.
 9. {split_rule}"""
 
+DAY_SCHEMA = PLAN_SCHEMA["properties"]["days"]["items"]
+DAY_RULES = """How to fill in the session. The bot lays it out for Telegram, so write plain words in every field (no markdown, no emojis):
+1. Group the exercises into sections by body part, in training order, like the plan. Keep a "Shoulder rehab" section on upper body days.
+2. For every exercise give sets, reps, load (a real weight in kg, or bodyweight or light band), rest in seconds, effort as RPE, tempo, the muscles it trains, one short form cue, how my left arm does it (left_arm, only when the exercise uses the arms), YouTube search words for a form video and a shoulder friendly swap.
+3. Put the new total time in minutes. warm_up and cool_down are short lists of steps. note is one or two short sentences on what changed, or empty.
+4. The video field holds only the search words, without [yt: ]. Write no dashes; use commas instead."""
+
 _PLAN_TEXT_FIELDS = ("name", "superset", "reps", "load", "effort", "tempo", "muscles", "cue", "left_arm", "video", "swap")
 
 
@@ -2745,6 +2752,72 @@ class Coach:
                 monday, request, kind="adjusted", save_split=False, tidy=keep_past if data else None
             )
 
+    async def alt_session(self, day: date, kind: str) -> tuple[dict, str, list[str]] | None:
+        """A lighter (kind "light") or 30 minute ("short") version of the day's session as
+        card data: (day data, the question, injury warnings). None when plans use the text
+        format or the structured reply fails, so the caller asks for a text answer instead.
+        Sign in, limit, network and time out errors are raised."""
+        if not self.cfg.structured_plans:
+            return None
+        monday = monday_of(day)
+        name = DAY_NAMES[day.weekday()]
+        data = self.store.load_plan_data(monday)
+        entry = next((d for d in data["days"] if d["day"] == name), None) if data else None
+        parsed = parse_plan(self.store.load_plan(monday) or "").days.get(day.weekday())
+        focus = entry["focus"] if entry else (parsed.focus if parsed else "")
+        when = "today" if day == self.today() else name
+        session = f"{when}'s session" + (f" ({focus})" if focus else "")
+        if kind == "short":
+            question = f"I only have 30 minutes {when}. Give me a 30 minute version of {session}."
+            how = ("Keep the most important work, drop the rest, use supersets and shorter rests. "
+                   "The total, warm up and cool down included, must be 30 minutes or less.")
+        else:
+            question = f"Give me a lighter version of {session}, based on my recovery and my shoulder."
+            how = ("Use fewer sets, lighter loads and an effort of about RPE 5 to 6. Keep the "
+                   "same body parts where it makes sense.")
+        current = self.plan_json(entry) if entry else (parsed.text if parsed else "No session is planned.")
+        request = "\n".join([question, how, f"Return only this one day, {name}.", "", DAY_RULES, "",
+                             "The session now:", current])
+
+        def read(reply: str) -> dict | None:
+            raw = normalize_plan(reply) if reply.lstrip().startswith("{") else None
+            if raw is None:  # Claude answers with one day, not a week
+                with contextlib.suppress(ValueError):
+                    one = json.loads(reply)
+                    if isinstance(one, dict):
+                        raw = normalize_plan({"days": [{**one, "day": name}]})
+            return raw["days"][0] if raw and raw["days"] else None
+
+        def blocked(new: dict) -> list[str]:
+            text = plan_to_text({"split_explanation": "", "days": [new], "notes": []})
+            return [
+                f"\"{hit['line']}\": {hit['term'].replace(' * ', ' ')} is a movement my injury rules leave out."
+                for hit in find_blocked(text, self.cfg.blocked_movements, self.cfg.allowed_movements)
+            ]
+
+        system = self.system_prompt()
+        try:
+            new = read(await self.runner.run(system, request, "day", DAY_SCHEMA))
+            problems = blocked(new) if new else []
+            if problems:  # one fix, like the weekly plans
+                fix = "\n".join(["Your session below has problems the bot found:", *[f"• {p}" for p in problems],
+                                 "", "Rewrite it with a shoulder friendly swap for each, and keep everything else.",
+                                 f"Return only this one day, {name}.", "", DAY_RULES, "", "The session:",
+                                 self.plan_json(new)])
+                fixed = read(await self.runner.run(system, fix, "day", DAY_SCHEMA))
+                if fixed and len(blocked(fixed)) < len(problems):
+                    new = fixed
+                problems = blocked(new)
+        except ClaudeError as exc:
+            if exc.timed_out or exc.user_message in (MSG_AUTH, MSG_LIMIT, MSG_NETWORK):
+                raise
+            log.warning("The structured %s version failed (%s), asking for text", kind, exc)
+            return None
+        if new is None:
+            return None
+        new["day"] = name
+        return new, question, problems
+
     def capture_checkin(self, message) -> str | None:
         """Save a reply to the Sunday check in, or the next message before the plan time."""
         st = self.store.state().get("checkin")
@@ -3462,7 +3535,7 @@ async def status_text(coach: Coach, application: Application) -> str:
     ]
     last = coach.runner.last_call
     if last:
-        what = "question" if last["kind"] == "ask" else "plan"
+        what = {"ask": "question", "day": "workout"}.get(last["kind"], "plan")
         if last["ok"]:
             lines.append(f"• Last Claude call: ✅ worked, {fmt_when(last['at'])} ({what})")
         else:
@@ -3716,6 +3789,23 @@ async def on_alt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def _answer_alt(update, context, coach, day, kind) -> None:
     query = update.callback_query
     await query.answer("Asking your coach…")
+    chat_id = update.effective_chat.id
+    try:
+        async with typing(context.bot, chat_id):
+            result = await coach.alt_session(day, kind)
+    except ClaudeError as exc:
+        await reply(update, context, exc.user_message)
+        return
+    if result:
+        new, question, warnings = result
+        label = "⏱ 30 minute version" if kind == "short" else "🪶 Lighter version"
+        blocks = day_card_blocks(new, f"{label} of today's session", day)
+        if warnings:
+            blocks.insert(-1, to_html("⚠️ Please check:\n" + "\n".join(f"• {w}" for w in warnings)))
+        await send_blocks(context.bot, chat_id, blocks)
+        text = plan_to_text({"split_explanation": "", "days": [new], "notes": []})
+        coach.store.add_memory(chat_id, question, text[:3000], coach.now())  # for follow up questions
+        return
     plan = coach.store.load_plan(monday_of(day)) or ""
     focus = getattr(parse_plan(plan).days.get(day.weekday()), "focus", "")
     when = "today" if day == coach.today() else DAY_NAMES[day.weekday()]
