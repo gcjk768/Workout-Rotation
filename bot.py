@@ -60,6 +60,8 @@ DAY_LOOKUP.update({name[:3].lower(): i for i, name in enumerate(DAY_NAMES)})
 DAY_LOOKUP.update({"tues": 1, "wed": 2, "thur": 3, "thurs": 3})
 
 MAX_MESSAGE = 4096
+HEARTBEAT = Path(tempfile.gettempdir()) / "coach-heartbeat"
+HEARTBEAT_MAX_AGE = 180  # seconds; the Docker health check fails after this
 MEMORY_TURNS = 6
 
 
@@ -2947,7 +2949,7 @@ async def status_text(coach: Coach, application: Application) -> str:
     jobs = application.job_queue.jobs() if application.job_queue else ()
     lines += ["", "**Next reminders**"]
     upcoming = sorted(
-        ((when, JOB_LABELS.get(job.name, job.name)) for job in jobs if (when := job_next(job))),
+        ((when, JOB_LABELS[job.name]) for job in jobs if job.name in JOB_LABELS and (when := job_next(job))),
         key=lambda item: item[0],
     )
     if upcoming:
@@ -3001,6 +3003,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def post_init(application: Application) -> None:
     await application.bot.set_my_commands([BotCommand(name, desc) for name, desc in COMMANDS])
     coach: Coach = application.bot_data["coach"]
+    beat()
     for leftover in Path(tempfile.gettempdir()).glob("coach-system-*.md"):
         with contextlib.suppress(OSError):
             leftover.unlink()  # left behind if the container was killed mid call
@@ -3053,7 +3056,6 @@ JOB_LABELS = {
     "checkin": "Sunday check in",
     "weekly_plan": "Next week's plan",
     "token_check": "Token expiry check",
-    "catch_up": "Start up catch up",
 }
 
 CHECKIN_TEXT = """🗓 Weekly check in
@@ -3282,6 +3284,15 @@ async def job_weekly_plan(context: ContextTypes.DEFAULT_TYPE) -> None:
     await build_next_week(context, monday_of(coach.today()) + timedelta(days=7))
 
 
+async def job_heartbeat(context: ContextTypes.DEFAULT_TYPE) -> None:
+    beat()
+
+
+def beat() -> None:
+    with contextlib.suppress(OSError):
+        HEARTBEAT.write_text(now_in(ZoneInfo("UTC")).isoformat(timespec="seconds"))
+
+
 async def job_token_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     text = coach_of(context).token_reminder()
     if text:
@@ -3345,6 +3356,7 @@ def schedule_jobs(application: Application) -> None:
     jq.run_daily(job_weekly_plan, at(cfg.plan_time), days=ptb_days([6]), name="weekly_plan", **daily)
     jq.run_daily(job_token_check, at(cfg.token_check_time), name="token_check", **daily)
     jq.run_once(job_catch_up, 20, name="catch_up")
+    jq.run_repeating(job_heartbeat, interval=60, first=1, name="heartbeat")
 
 
 def build_application(
@@ -3363,7 +3375,24 @@ def build_application(
     return application
 
 
+def health_check() -> int:
+    """Exit code for Docker's HEALTHCHECK: 0 while the heartbeat is fresh."""
+    import time
+
+    try:
+        age = time.time() - HEARTBEAT.stat().st_mtime
+    except OSError:
+        print("no heartbeat yet")
+        return 1
+    print(f"heartbeat {age:.0f}s ago")
+    return 0 if age < HEARTBEAT_MAX_AGE else 1
+
+
 def main() -> None:
+    import sys
+
+    if "--health" in sys.argv:
+        raise SystemExit(health_check())
     try:
         cfg = Config.from_env()
     except ConfigError as exc:

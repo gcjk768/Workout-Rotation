@@ -4,9 +4,11 @@ A private Telegram bot that coaches you like a personal trainer. It runs in Dock
 
 - Answers training questions (`/ask`, or just write to it), with web search for real videos.
 - Builds a full 7-day plan every week. The split stays the same while the exercises change. The main equipment rotates (dumbbells, cables, machines, barbell and kettlebells). Effort follows a 4-week wave: three building weeks, then a deload.
-- Protects your left shoulder. Every new plan is checked for movements your injury rules leave out. If one slips in, Claude fixes the plan once before it's saved.
+- Protects your left shoulder. Every new plan is checked for movements your injury rules leave out, first by a rule check and then by a quick second opinion from a small Claude model. If anything slips in, Claude fixes the plan once before it's saved.
 - Sends that day's workout every morning, with buttons for a lighter or a 30-minute version. It reminds you again before the gym and checks at 9pm whether you trained. On Sunday it asks how the week went, then builds next week's plan from your answer.
-- Reads your sleep, resting heart rate, HRV, body battery and runs from your garmin-monitor app, and warns you when your recovery looks low.
+- Reads your sleep, resting heart rate, HRV, body battery, runs and workouts from your garmin-monitor app. It warns you when your recovery looks low, and marks the day done when your watch recorded a workout.
+- Knows Singapore public holidays and the days you're away (`/away`), and plans a hotel gym or bodyweight version for them.
+- Tracks the weights you log (`/progress`), sends your shoulder ratings as a spreadsheet file for your physio, and adds "last week in numbers" to the Sunday overview.
 
 ## Files
 
@@ -14,10 +16,12 @@ A private Telegram bot that coaches you like a personal trainer. It runs in Dock
 |---|---|
 | `bot.py` | The bot |
 | `requirements.txt` | Python packages |
-| `Dockerfile` | Python 3.12 slim image with Claude Code (native installer) |
+| `Dockerfile` | Python 3.12 slim image with Claude Code (native installer), running as a normal user with a health check |
+| `entrypoint.sh` | Gives the bot's user its folders, then starts the bot as that user |
 | `compose.yaml` | The container, the `./data` folder and a read-only mount of garmin-monitor's data |
 | `bot.env.example` | Every personal setting. Copy it to `bot.env` |
 | `tests/` | Tests with a fake `claude`, a fake Telegram and sample Garmin data |
+| `.github/workflows/ci.yml` | On every push, GitHub runs the tests, builds the real image and runs the end-to-end check against it |
 
 ## Setup on the NAS (DXP4800 Pro, UGOS Pro)
 
@@ -30,6 +34,8 @@ A private Telegram bot that coaches you like a personal trainer. It runs in Dock
    - `CLAUDE_TOKEN_CREATED`, the date from step 1
 
    Leave `ALLOWED_USER_IDS` empty for now. Check the other settings too: about you, reminder times and basketball days. Don't put ` #` or `$` inside a value, because Docker reads them specially. Then run `chmod 600 bot.env`, since the file holds your tokens.
+
+   The bot runs as a normal user, not root. Set `PUID` and `PGID` to your NAS account's numbers, so the files in `./data` belong to you. Over SSH, `id` shows them (for example `uid=1000 gid=10`).
 5. **Check the Garmin path.** `compose.yaml` mounts `/volume1/docker/garmin-monitor/data` read-only. Change that line if garmin-monitor lives somewhere else. In `bot.env`, `GARMIN_PROFILE` must match the profile name in garmin-monitor's `config.yaml` (default `Me`).
 6. **Start it.** Enable SSH in UGOS (Control Panel → Terminal), connect, and run:
    ```sh
@@ -45,15 +51,16 @@ A private Telegram bot that coaches you like a personal trainer. It runs in Dock
 ## Test Claude Code inside the container
 
 ```sh
-# version and sign in
-sudo docker exec gym-coach-bot claude --version
-sudo docker exec gym-coach-bot claude auth status
+# version and sign in, as the user the bot runs as
+sudo docker exec -u coach gym-coach-bot claude --version
+sudo docker exec -u coach gym-coach-bot claude auth status
 
 # one real call, the same way the bot makes them (from the empty /work folder)
-sudo docker exec -w /work gym-coach-bot sh -c \
+sudo docker exec -u coach -w /work gym-coach-bot sh -c \
   'echo "Reply with five words about squats" | claude -p --output-format json --no-session-persistence --permission-mode dontAsk --model sonnet --tools ""'
 
-# bot logs (tokens are never written to them)
+# health (the NAS Docker app shows the same) and bot logs (tokens are never written to them)
+sudo docker inspect --format '{{.State.Health.Status}}' gym-coach-bot
 sudo docker logs --tail 100 gym-coach-bot
 ```
 
@@ -70,8 +77,10 @@ In the JSON reply, `"is_error": false` and a `result` text mean everything works
 | `/nextweek [notes]` | Build next week's plan now |
 | `/log <what you did>` | Save it with today's date, for example `/log rows 22kg 3x10, floor press 14kg 3x8 felt easy`. `/log` alone lists the last 2 weeks. |
 | `/done` | Mark today's session finished, then rate your left shoulder 0 to 10 with the buttons |
-| `/shoulder` | Your full shoulder rating log for your physio. `/shoulder 3` saves a rating. |
+| `/shoulder` | Your full shoulder rating log with a weekly chart, plus a CSV file for your physio. `/shoulder 3` saves a rating. |
+| `/progress` | The weights and reps from your logs, per exercise, first to latest |
 | `/injury [notes]` | Show or replace your injury notes. `/injury none` clears them. |
+| `/away [dates] [note]` | Days away, on leave or travelling, for example `/away 8 Oct to 10 Oct Bangkok trip` or `/away thu fri`. `/away` lists them with upcoming public holidays, and `/away clear` removes them. |
 | `/profile` | What the coach knows about you, including your shoulder trend and Garmin data |
 | `/status` | Claude Code version, sign-in, the last plan built and the next reminders |
 | `/reset` | Clear the chat memory |
@@ -85,9 +94,9 @@ Shoulder ratings: 0 means no pain and 10 means the worst pain, so a rising trend
 |---|---|
 | Every day 07:00 | That day's workout, or that it's a rest day, with your Garmin recovery from last night. Workout days get 🪶 **Lighter version** and ⏱ **30 minute version** buttons, which ask the coach to rewrite the session. |
 | Mon to Thu 17:30, Fri 17:00 | Today's session again before the gym, with a warning if Garmin shows poor recovery |
-| 21:00 on training days | "Did you train today?" with Done and Skipped buttons, unless you already sent `/done`. **Skipped** rewrites the rest of the week so you don't double up. The old version is kept in `data/plans/history/`. |
+| 21:00 on training days | If your watch recorded a workout of 15 minutes or more that day, the day is marked done and you're asked for your shoulder rating. Otherwise "Did you train today?" with Done and Skipped buttons, unless you already sent `/done`. **Skipped** rewrites the rest of the week so you don't double up. The old version is kept in `data/plans/history/`. |
 | Sunday 18:00 | Check-in: energy, soreness, shoulder. Your reply to that message, or your next message before 20:00, is saved. |
-| Sunday 20:00 | Builds next week's plan from your check-in (or without one) and sends an overview with your shoulder trend |
+| Sunday 20:00 | Builds next week's plan from your check-in (or without one) and sends an overview with last week in numbers (sessions, logs, shoulder, runs, sleep) and your shoulder trend |
 | Daily 10:00 | From 30 days before your Claude token expires: a reminder to run `claude setup-token` again |
 
 Leave a time empty in `bot.env` (for example `CHECK_TIME=`) to turn that reminder off. `DAILY_WORKOUT_DAYS` picks the days for the morning message.
@@ -101,14 +110,23 @@ If the bot was off at a reminder time, it catches up when it starts. It sends a 
   - The system prompt comes from `--system-prompt-file` and your message goes in on stdin.
   - Questions add `--tools WebSearch --allowedTools WebSearch --max-turns 10` and time out after 4 minutes.
   - Plans add `--tools "" --max-turns 3` and time out after 10 minutes.
+  - The safety review uses the same no-tools flags with `CLAUDE_MODEL_CHECK` (haiku by default).
+  - A brief failure (Claude overloaded, a server error or a network blip) is retried once after 5 seconds. Sign-in problems and usage limits are not.
   - `--bare` is never used, because bare mode ignores the subscription token.
-- **System prompt.** Your coach prompt is filled from `bot.env`. The bot then adds today's date, your injury notes, this week's plan, sessions done or skipped, 14 days of logs and shoulder ratings, the latest check-in and 7 days of Garmin data.
+- **System prompt.** Your coach prompt is filled from `bot.env`. The bot then adds:
+  - today's date, your injury notes and this week's plan;
+  - sessions done or skipped, and 14 days of logs and shoulder ratings;
+  - your logged weights per exercise, and the latest check-in;
+  - days away or public holidays in the next two weeks;
+  - 7 days of Garmin data.
 - **Plans.** Each plan is saved as `data/plans/<Monday>.md`, with a `.json` file next to it that records the week number, equipment, effort and any warnings.
   - Each day starts with a line like `📅 Monday: Push`, which is how `/today` finds the right day.
   - The split chosen in week 1 is saved and sent back to Claude every week.
   - Exercises from the two previous weeks are listed so none repeat. Rehab exercises may repeat.
 - **Injury check.** Every line of every day is checked for movements your injury rules leave out, including warm-ups, finishers, options and text in brackets. Lines that only list what to avoid ("no overhead pressing, dips or upright rows") and swaps ("landmine press instead of overhead press") are not flagged. The built-in lists live in `bot.py`, so they improve with updates. Add your own with `INJURY_EXTRA_BLOCKED` and `INJURY_EXTRA_ALLOWED`, and set `INJURY_CHECK=off` once your physio clears you.
-- **Garmin.** garmin-monitor's `monitor.db` is opened read-only and never written to.
+- **Garmin.** garmin-monitor's `monitor.db` is opened read-only and never written to. Set `GARMIN_AUTO_DONE=off` if you don't want watch workouts to count as done.
+- **Holidays.** `HOLIDAYS_COUNTRY=SG` uses the public holiday calendar from the `holidays` package, including observed Mondays. Leave it empty to turn this off.
+- **Docker.** The container runs as a normal user (`PUID`/`PGID`), with `init` to reap processes and a health check the NAS Docker app shows. To pin Claude Code to one version, build with `sudo CLAUDE_CODE_VERSION=2.1.285 docker compose up -d --build`.
 - **Log safety.** Tokens are never logged. The `httpx` logger is set to WARNING because it prints the bot token in request URLs, and every log line is filtered for secrets.
 
 ## Everyday maintenance
@@ -117,7 +135,7 @@ If the bot was off at a reminder time, it catches up when it starts. It sends a 
   1. Run `claude setup-token`.
   2. Update `CLAUDE_CODE_OAUTH_TOKEN` and `CLAUDE_TOKEN_CREATED` in `bot.env`.
   3. Run `sudo docker compose up -d`.
-- **Update the bot:** copy the new files over the old ones, then run `sudo docker compose up -d --build`.
+- **Update the bot:** copy the new files over the old ones, then run `sudo docker compose up -d --build`. Each push to GitHub runs CI first (Actions tab), so you can check that the tests passed and the image built before you update.
 - **API key instead of the subscription:** set `ANTHROPIC_API_KEY` and leave `CLAUDE_CODE_OAUTH_TOKEN` empty.
 
 ## Troubleshooting

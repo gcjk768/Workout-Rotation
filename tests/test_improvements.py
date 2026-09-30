@@ -257,3 +257,39 @@ async def test_sunday_overview_has_last_week_in_numbers(app, claude, clock, cfg)
     assert "<b>Last week in numbers</b>\n• Sessions: 1 done, 0 skipped (5 training days planned)" in text
     assert "• Workout logs: 1" in text and "• Left shoulder: average 3.0" in text
     assert "• Runs: 2, 10.7 km" in text and "• Sleep: 7.4 h a night on average" in text
+
+
+# ---------------------------------------------------------------------------
+# Docker health check
+# ---------------------------------------------------------------------------
+
+
+def test_health_check_follows_the_heartbeat(tmp_path, monkeypatch):
+    import os
+    import time
+
+    monkeypatch.setattr(bot, "HEARTBEAT", tmp_path / "beat")
+    assert bot.health_check() == 1  # no heartbeat yet
+    bot.beat()
+    assert bot.health_check() == 0
+    old = time.time() - bot.HEARTBEAT_MAX_AGE - 5
+    os.utime(bot.HEARTBEAT, (old, old))
+    assert bot.health_check() == 1
+
+
+async def test_bot_beats_at_start_and_every_minute(app, tmp_path, monkeypatch):
+    monkeypatch.setattr(bot, "HEARTBEAT", tmp_path / "beat")
+    await bot.post_init(app)
+    assert bot.HEARTBEAT.exists()
+    job = [j for j in app.job_queue.jobs() if j.name == "heartbeat"][0]
+    assert job.job.trigger.interval.total_seconds() == 60
+
+
+async def test_status_hides_internal_jobs(app):
+    await app.job_queue.start()
+    try:
+        status = (await send(app, "/status"))[0]
+    finally:
+        await app.job_queue.stop()
+    assert "heartbeat" not in status and "catch up" not in status
+    assert "Daily workout" in status
