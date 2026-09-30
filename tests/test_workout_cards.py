@@ -374,3 +374,70 @@ async def test_a_direct_video_link_gets_a_preview(app, claude, clock):
     preview = message["link_preview_options"]
     preview = json.loads(preview) if isinstance(preview, str) else preview
     assert preview["url"] == link and not preview.get("is_disabled")
+
+
+# ---------------------------------------------------------------------------
+# Lighter and 30 minute versions
+# ---------------------------------------------------------------------------
+
+
+async def test_lighter_version_is_a_card(app, claude, clock):
+    await send(app, "/plan")
+    before = len(app.tg.sent())
+    await press(app, "alt:2026-09-30:light")
+    call = claude.plan_calls()[-1]
+    argv = call["argv"]
+    assert json.loads(argv[argv.index("--json-schema") + 1]) == bot.DAY_SCHEMA
+    assert "WebSearch" not in argv
+    assert "Give me a lighter version of today's session (Legs and core)" in call["stdin"]
+    assert "Return only this one day, Wednesday." in call["stdin"] and '"body_part": "Chest"' in call["stdin"]
+    messages = html_messages(app, before)
+    assert_telegram_accepts(messages)
+    text = "\n\n".join(m["text"] for m in messages)
+    assert text.startswith("<b>📅 Wednesday 30 Sep · Legs and core, lighter</b>\n<i>🪶 Lighter version of today's session</i>")
+    assert "⏱ About 45 min" in text and "<code>2 × 10</code> · <b>12.5 kg</b> · rest 1 min 30 s · RPE 5" in text
+    assert "💬 Fewer sets and lighter weights." in text and "<blockquote expandable>" in text
+    coach = app.bot_data["coach"]
+    memory = coach.store.memory(OWNER)[-1]
+    assert memory["q"].startswith("Give me a lighter version") and "📅 Wednesday: Legs and core, lighter" in memory["a"]
+    assert coach.store.load_plan_data(MONDAY)["days"][2]["focus"] == "Legs and core"  # the plan is unchanged
+
+
+async def test_thirty_minute_version_is_a_card(app, claude, clock):
+    await send(app, "/plan")
+    before = len(app.tg.sent())
+    await press(app, "alt:2026-09-30:short")
+    assert "30 minutes or less" in claude.plan_calls()[-1]["stdin"]
+    text = "\n\n".join(m["text"] for m in html_messages(app, before))
+    assert "<i>⏱ 30 minute version of today's session</i>" in text and "⏱ About 30 min" in text
+
+
+async def test_alt_version_gets_the_injury_check(app, claude, clock):
+    await send(app, "/plan")
+    day = {"focus": "Push, lighter", "rest_day": False, "minutes": 40, "warm_up": ["Bike"], "cool_down": ["Stretch"],
+           "sections": [{"body_part": "Chest", "exercises": [exercise("Dips"), exercise("Upright row")]}], "note": ""}
+    claude.enqueue({"structured": day})
+    before = len(app.tg.sent())
+    await press(app, "alt:2026-09-30:light")
+    fix = claude.plan_calls()[-1]["stdin"]
+    assert fix.startswith("Your session below has problems the bot found:") and "dip is a movement" in fix
+    text = "\n\n".join(m["text"] for m in html_messages(app, before))
+    assert "Push up" in text and "💬 FIXED" in text  # the fix swapped the dips
+    assert "⚠️ Please check:" in text and "upright row" in text  # the fake left the upright row in
+
+
+async def test_alt_version_falls_back_to_a_text_answer(app, claude, clock):
+    await send(app, "/plan")
+    claude.enqueue({"mode": "structured_fail"})
+    replies = await press(app, "alt:2026-09-30:short")
+    last = claude.last()
+    assert "WebSearch" in last["argv"] and "I only have 30 minutes today" in last["stdin"]
+    assert "Coach says" in app.tg.texts()[-1]
+
+
+async def test_alt_version_reports_sign_in_problems(app, claude, clock):
+    await send(app, "/plan")
+    claude.enqueue({"mode": "auth"}, {"mode": "auth"})
+    calls = len(claude.all())
+    await press(app, "alt:2026-09-30:light")
+    assert len(claude.all()) == calls + 1 and "token" in app.tg.texts()[-1].lower()

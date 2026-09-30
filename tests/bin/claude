@@ -140,7 +140,35 @@ def exercise(name, sets=3, reps="10", load="12.5 kg", rest=90, **extra):
     return item
 
 
+def make_day(text):
+    """A lighter or 30 minute version of one day (the bot's Lighter and 30 minute buttons)."""
+    name = re.search(r"Return only this one day, (\w+)\.", text).group(1)
+    fixing = _after("The session:", text) if "Your session below has problems" in text else None
+    if fixing:
+        fixing["note"] = "FIXED"
+        for sec in fixing["sections"]:
+            for ex in sec["exercises"]:
+                ex["name"] = ex["name"].replace("Dips", "Push up")
+        return fixing
+    current = _after("The session now:", text)
+    day = current if isinstance(current, dict) else {
+        "day": name, "focus": "Training", "rest_day": False, "warm_up": ["Walk"], "cool_down": ["Stretch"],
+        "sections": [{"body_part": "Legs", "exercises": [exercise("Goblet squat")]}]}
+    short = "30 minute version" in text
+    day["focus"] = day["focus"] + (", 30 minutes" if short else ", lighter")
+    day["minutes"] = 30 if short else 45
+    day["note"] = "Supersets and shorter rests." if short else "Fewer sets and lighter weights."
+    for sec in day["sections"]:
+        for ex in sec["exercises"]:
+            ex["sets"] = max(1, int(ex.get("sets") or 1) - 1)
+            ex["effort"] = "RPE 5"
+    day.pop("day", None)  # a real reply may leave it out; the bot sets it
+    return day
+
+
 def make_structured(text):
+    if "Return only this one day" in text:
+        return make_day(text)
     fixing = _after("The plan:", text) if "Your plan below has problems" in text else None
     adjusting = _after("This week's plan:", text) if "I skipped" in text else None
     base = fixing or adjusting
