@@ -203,7 +203,7 @@ The bot is built to keep running on the NAS without you watching it.
 
 ## NAS Doctor
 
-nas-doctor (a separate stack, `/volume1/docker/nas-doctor`) watches every container on the NAS. When `gym-coach-bot` is crash-looping, dead, unhealthy (the health check above) or exited with an error, it posts to the "NAS Doctor" topic and asks `claude -p` to fix it. The bot's own self repair handles problems inside the process. NAS Doctor handles the container itself: a bad build, a broken mount or a container that won't start. `/fix gym-coach-bot` in the NAS Doctor chat runs the same repair on demand.
+nas-doctor (a separate stack, `/volume1/docker/nas-doctor`) watches every container on the NAS. When `gym-coach-bot` is crash-looping, dead, unhealthy (the health check above) or exited with an error, it posts to the "NAS Doctor" topic and asks `claude -p` to fix it. The bot's own self repair handles problems inside the process. NAS Doctor handles the container itself: a bad build, a broken mount or a container that won't start. `/fix gym-coach-bot` in the NAS Doctor chat runs the same repair on demand. Set `REPAIR_ALERT_CHAT=<TELEGRAM_CHAT_ID>/2930` in `bot.env` to copy every 🩺 self repair alert into the NAS Doctor topic too (the bot must be a member of that group).
 
 Runbook for NAS Doctor (and anyone else fixing this stack):
 
