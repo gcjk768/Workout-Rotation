@@ -53,7 +53,7 @@ jobs:
           FAKE_CLAUDE_STRUCTURED=1
           EOF
           python tests/e2e_scenario.py --serve 8090 > scenario.log 2>&1 &
-          docker run -d --name coach --network host --env-file bot.env \
+          docker run -d --name coach --network host --env-file bot.env --restart unless-stopped --init \
             -v "$PWD/data:/data" -v "$PWD/garmin:/garmin:ro" \
             -v "$PWD/tests/bin/claude:/fake/claude:ro" gym-coach-bot:ci
           for i in $(seq 1 90); do
@@ -67,4 +67,13 @@ jobs:
           docker exec coach python /app/bot.py --health
           test "$(stat -c %u data/state.json)" = "1000"
           if docker logs coach 2>&1 | grep -q "AAE2eFakeToken\|CIFAKE"; then echo "token in logs"; exit 1; fi
+          # A hard crash (like an out of memory kill): Docker must start the bot again
+          docker exec coach python -c "import os; [os.kill(int(p), 9) for p in os.listdir('/proc') if p.isdigit() and int(p) != os.getpid() and b'bot.py' in open(f'/proc/{p}/cmdline', 'rb').read()]" || true
+          for i in $(seq 1 30); do
+            [ "$(docker inspect -f '{{.RestartCount}}' coach)" -ge 1 ] && [ "$(docker inspect -f '{{.State.Running}}' coach)" = true ] && break
+            sleep 2
+          done
+          docker inspect -f 'restarts={{.RestartCount}} running={{.State.Running}}' coach
+          test "$(docker inspect -f '{{.RestartCount}}' coach)" -ge 1
+          test "$(docker inspect -f '{{.State.Running}}' coach)" = true
           docker stop coach
