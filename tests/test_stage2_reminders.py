@@ -481,3 +481,15 @@ async def test_catch_up_does_nothing_when_up_to_date(app, claude, clock):
     clock.set(2026, 10, 1, 9, 0)
     await bot.job_catch_up(job_context(app))
     assert app.tg.texts() == []
+
+
+async def test_checkin_only_captures_the_owner(app, claude, clock):
+    await start_programme(app, claude, clock)
+    clock.set(2026, 10, 4, 18, 0)
+    await bot.job_checkin(job_context(app))
+    clock.set(2026, 10, 4, 18, 30)
+    await send(app, "Hi coach, second account here", user_id=222222)
+    assert claude.last()["stdin"].endswith("Hi coach, second account here")
+    assert app.bot_data["coach"].store.load_checkin(date(2026, 10, 4)) is None
+    texts = await send(app, "Energy fine")
+    assert texts[0].startswith("Thanks, I saved your check in")
