@@ -239,6 +239,13 @@ pip install -r requirements.txt pytest pytest-asyncio
 python -m pytest
 ```
 
+On Windows, run them in Docker instead (the fake `claude` is a Linux script):
+
+```sh
+docker build -t gym-coach-bot:local .
+MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD":/src:ro gym-coach-bot:local sh -c 'cp -r /src /tmp/app && cd /tmp/app && rm -rf .venv && pip install -q pytest pytest-asyncio && python -m pytest -q -p no:cacheprovider'
+```
+
 `tests/test_e2e_process.py` starts the real `python bot.py` process against a stand-in Bot API (`tests/fake_bot_api.py`). It long-polls, sends commands and presses buttons, then stops the bot with SIGTERM the way Docker does. The stand-in rejects anything real Telegram would reject: broken HTML, messages over 4096 characters and button data over 64 bytes. So a formatting bug fails the test instead of hiding.
 
 `TELEGRAM_BASE_URL` stays empty in normal use, which means api.telegram.org. It exists for a local Bot API server and for these tests. Never point your real bot at the stand-in: it only accepts the test token from `tests/e2e_scenario.py`.

@@ -23,6 +23,20 @@ sys.path.insert(0, str(ROOT))
 
 import bot  # noqa: E402
 
+DOCKER_TESTS = (
+    "docker build -t gym-coach-bot:local . && docker run --rm -v \"$PWD\":/src:ro gym-coach-bot:local sh -c "
+    "'cp -r /src /tmp/app && cd /tmp/app && rm -rf .venv && pip install -q pytest pytest-asyncio "
+    "&& python -m pytest -q -p no:cacheprovider'"
+)
+
+
+def pytest_configure(config):
+    # Windows can't exec the extensionless shebang script tests/bin/claude, so every
+    # Claude call would fail with "not installed". Stop with the fix instead.
+    if sys.platform == "win32":
+        pytest.exit(f"These tests need Linux (the bot runs in a Linux container). Run them in Docker:\n{DOCKER_TESTS}", 2)
+
+
 FAKE_BIN = Path(__file__).resolve().parent / "bin"
 BOT_TOKEN = "123456789:AAFakeTokenForTestsOnly_abcdefghijklmnopq"
 OWNER = 111111
