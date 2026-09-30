@@ -57,7 +57,7 @@ sudo docker exec -w /work gym-coach-bot sh -c \
 sudo docker logs --tail 100 gym-coach-bot
 ```
 
-In the JSON reply, `"is_error": false` and a `result` text mean everything works. `/status` in Telegram shows the same information: version, sign-in, the last plan and the next reminders.
+In the JSON reply, `"is_error": false` and a `result` text mean everything works. `/status` in Telegram shows the version, sign-in, the last plan and the next reminders. `claude auth status` only proves a token is set, not that it's still valid, so `/status` also shows whether the last real Claude call worked.
 
 ## Commands
 

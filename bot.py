@@ -138,7 +138,7 @@ DEFAULT_BLOCKED = (
 )
 DEFAULT_ALLOWED = (
     "reverse * fly, reverse * flye, reverse * flies, rear delt * fly, rear delt * flye, "
-    "rear delt * flies, dumbbell * bench press, db * bench press"
+    "rear delt * flies, dumbbell * bench press, db * bench press, landmine * press"
 )
 DEFAULT_ROTATION = "dumbbells, cables, machines, barbell and kettlebells"
 
@@ -486,6 +486,9 @@ NOTES_RE = re.compile(r"^[\s*_>#]*📝")
 NUMBERED_RE = re.compile(r"^\s*[*_]*\s*(\d{1,2})\s*[.)]\s*(.+)$")
 BULLET_LINE_RE = re.compile(r"^\s*(?:[•\-*+–]\s+|[*_]*\s*\d{1,2}\s*[.)]\s*)(.+)$")
 REST_RE = re.compile(r"\b(rest|off)\b", re.IGNORECASE)
+STRENGTH_DAY_RE = re.compile(
+    r"push|pull|leg|upper|lower|chest|back|arm|shoulder|full body|strength|gym", re.IGNORECASE
+)
 TRAINING_WORDS_RE = re.compile(
     r"push|pull|leg|upper|lower|chest|back|arm|shoulder|full body|swim|run|conditioning|"
     r"strength|core|gym|lift|power",
@@ -882,7 +885,16 @@ MSG_AUTH = (
     "claude setup-token, put the new token in bot.env as CLAUDE_CODE_OAUTH_TOKEN, update "
     "CLAUDE_TOKEN_CREATED, then restart the bot."
 )
+NETWORK_RE = re.compile(
+    r"ECONNREFUSED|ENOTFOUND|ETIMEDOUT|ECONNRESET|EAI_AGAIN|connection refused|connection error|"
+    r"fetch failed|getaddrinfo|network is unreachable",
+    re.IGNORECASE,
+)
 MSG_LIMIT = "Claude is busy or your usage limit is reached. Please try again a bit later."
+MSG_NETWORK = (
+    "Claude Code could not reach Anthropic's servers. Check the NAS internet connection, "
+    "then try again."
+)
 
 
 class ClaudeRunner:
@@ -891,6 +903,7 @@ class ClaudeRunner:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self._slots = asyncio.Semaphore(2)
+        self.last_call: dict | None = None  # outcome of the latest real call, for /status
 
     def child_env(self) -> dict[str, str]:
         env = {k: v for k, v in os.environ.items() if k != "TELEGRAM_BOT_TOKEN"}
@@ -946,6 +959,15 @@ class ClaudeRunner:
 
     async def run(self, system_prompt: str, message: str, kind: str) -> str:
         """kind is 'ask' (web search on) or 'plan' (no tools). Returns the reply text."""
+        try:
+            result = await self._run(system_prompt, message, kind)
+        except ClaudeError as exc:
+            self.last_call = {"at": now_in(self.cfg.tz), "kind": kind, "ok": False, "message": exc.user_message}
+            raise
+        self.last_call = {"at": now_in(self.cfg.tz), "kind": kind, "ok": True, "message": ""}
+        return result
+
+    async def _run(self, system_prompt: str, message: str, kind: str) -> str:
         timeout = self.cfg.ask_timeout if kind == "ask" else self.cfg.plan_timeout
         fd, prompt_file = tempfile.mkstemp(prefix="coach-system-", suffix=".md")
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -987,6 +1009,8 @@ class ClaudeRunner:
                 raise ClaudeError(MSG_AUTH, detail)
             if LIMIT_RE.search(err + out):
                 raise ClaudeError(MSG_LIMIT, detail)
+            if NETWORK_RE.search(err + out):
+                raise ClaudeError(MSG_NETWORK, detail)
             raise ClaudeError(
                 "Claude Code sent back something I could not read. Check the bot logs, or test "
                 "Claude Code with docker exec as described in the README.",
@@ -1018,6 +1042,8 @@ class ClaudeRunner:
                 raise ClaudeError(MSG_AUTH, detail)
             if LIMIT_RE.search(text):
                 raise ClaudeError(MSG_LIMIT, detail)
+            if NETWORK_RE.search(text):
+                raise ClaudeError(MSG_NETWORK, detail)
             snippet = (result or subtype or "unknown error").strip()[:200]
             raise ClaudeError(f"Claude Code reported an error: {snippet}", detail)
         if not result.strip():
@@ -1335,7 +1361,7 @@ def coach_prompt(cfg: Config) -> str:
 
 PLAN_FORMAT_RULES = """Format rules. The bot reads your plan automatically, so follow them exactly:
 1. Cover all seven days, Monday to Sunday, in order.
-2. Start each day with one line in exactly this form: 📅 Monday: Push. Use the day name, a colon and the day's focus. Mark rest days in the focus, for example 📅 Sunday: Rest or light mobility.
+2. Start each day with one line in exactly this form: 📅 Monday: Push. Use the day name, a colon and the day's focus. Mark rest days in the focus, for example 📅 Saturday: Basketball or rest, or 📅 Sunday: Rest or light mobility.
 3. On training days write the warm up as one line starting with "Warm up:". Then number the main exercises and the rehab exercises, one per line, like "1. Exercise name: 3 x 10, rest 90s". Under each exercise add one "Cue:" line and one "Video: [yt: exercise name proper form]" line. Finish the day with one line starting with "Cool down:".
 4. After Sunday, write the general notes once, starting with a line that begins with 📝. Do not use 📝 anywhere else.
 5. Write nothing before the first 📅 line{preface_rule}."""
@@ -1470,17 +1496,28 @@ class Coach:
             "Go lighter today, or ask me for a lighter version of this session."
         )
 
-    def system_prompt(self) -> str:
+    def tz_label(self) -> str:
+        return "Singapore time" if str(self.cfg.tz) == "Asia/Singapore" else f"{self.cfg.tz} time"
+
+    def system_prompt(self, planning: date | None = None) -> str:
+        """planning: the Monday of the week a plan is being built for, if not this week."""
         now = self.now()
         today = now.date()
         monday = monday_of(today)
         week = self.week_number(monday)
         parts = [coach_prompt(self.cfg), "Context from the bot (use it, do not repeat it back)"]
         parts.append(
-            f"Today is {fmt_long(today)}, {now:%H:%M} Singapore time. This is week {week} of my "
-            f"programme (week of {fmt_long(monday)}). Main equipment this week: "
-            f"{self.equipment_for(week)}. Effort this week: {effort_for(week)}"
+            f"Today is {fmt_long(today)}, {now:%H:%M} {self.tz_label()}. The current week is week "
+            f"{week} of my programme (week of {fmt_long(monday)}). Its main equipment is "
+            f"{self.equipment_for(week)}. Its effort: {effort_for(week)}"
         )
+        if planning and planning != monday:
+            target = self.week_number(planning)
+            parts.append(
+                f"You are now building the plan for a different week: week {target}, the week of "
+                f"{fmt_long(planning)}. Its main equipment is {self.equipment_for(target)}. Its "
+                f"effort: {effort_for(target)} Follow the plan request for that week."
+            )
         injury, updated = self.injury_text()
         when = f" (updated {updated[:10]})" if updated else ""
         parts.append(
@@ -1542,6 +1579,14 @@ class Coach:
                 + join_names(parsed.missing_days)
                 + "."
             )
+        for day in parsed.days.values():
+            if STRENGTH_DAY_RE.search(day.focus) and not any(
+                exercise_name(line) for line in day.text.splitlines()[1:]
+            ):
+                problems.append(
+                    f"{day.name} ({day.focus}) has no numbered exercises. Number each exercise like "
+                    "\"1. Exercise name: 3 x 10, rest 90s\"."
+                )
         for hit in find_blocked(text, self.cfg.blocked_movements, self.cfg.allowed_movements):
             problems.append(
                 f"{hit['day']}, \"{hit['line']}\": {hit['term']} is a movement my injury rules "
@@ -1620,7 +1665,7 @@ class Coach:
     ) -> PlanResult:
         """Run Claude, check the plan, fix it once if needed, then save it."""
         had_split = bool(self.store.state().get("split"))
-        system = self.system_prompt()
+        system = self.system_prompt(planning=monday)
         text = clean_reply(await self.runner.run(system, request, "plan"))
         problems = self.plan_problems(text)
         fixed = False
@@ -1705,7 +1750,8 @@ class Coach:
     def capture_checkin(self, message) -> str | None:
         """Save a reply to the Sunday check in, or the next message before the plan time."""
         st = self.store.state().get("checkin")
-        if not st:
+        sender = message.from_user.id if message.from_user else None
+        if not st or sender != self.cfg.owner_id:
             return None
         now = self.now()
         replied = bool(message.reply_to_message) and message.reply_to_message.message_id == st.get("message_id")
@@ -1725,15 +1771,21 @@ class Coach:
             "tonight (or /plan from Monday) if you want it rebuilt with this answer."
         )
 
-    def token_reminder(self) -> str | None:
-        """A reminder text when the one year Claude token is within a month of expiring."""
+    def token_expires(self) -> date | None:
         created = self.cfg.token_created
         if not created:
             return None
         try:
-            expires = created.replace(year=created.year + 1)
+            return created.replace(year=created.year + 1)
         except ValueError:  # 29 February
-            expires = created + timedelta(days=365)
+            return created + timedelta(days=365)
+
+    def token_reminder(self) -> str | None:
+        """A reminder text when the one year Claude token is within a month of expiring."""
+        created = self.cfg.token_created
+        expires = self.token_expires()
+        if not created or not expires:
+            return None
         today = self.today()
         left = (expires - today).days
         if left > 30:
@@ -1784,13 +1836,15 @@ class Coach:
                 monday = nxt
             else:
                 note = (
-                    "\n\nNext week's plan is built on Sunday at "
-                    f"{self.cfg.plan_time:%H:%M}, or send /nextweek to build it now."
+                    "Next week's plan is not built yet. It gets built on Sunday at "
+                    f"{self.cfg.plan_time:%H:%M} after your check in, or send /nextweek to build it now."
                 )
         plan = self.store.load_plan(monday)
         if not plan:
             return "No plan is saved for this week yet. Send /plan to build one." + note
-        return f"**{self.week_label(monday)}**\n\n{plan.strip()}{note}"
+        if note:
+            return f"{note.strip()} Here is this week's plan until then.\n\n**{self.week_label(monday)}**\n\n{plan.strip()}"
+        return f"**{self.week_label(monday)}**\n\n{plan.strip()}"
 
     def rest_of_week(self, result: PlanResult, skipped: date) -> str:
         text = self.overview(result, "Here is the rest of your week, adjusted:", start=skipped.weekday() + 1)
@@ -2200,8 +2254,17 @@ async def status_text(coach: Coach, application: Application) -> str:
         f"• Sign in: {'✅ ' if signed_in else '⚠️ '}{auth}",
         f"• Models: questions {cfg.model_ask}, plans {cfg.model_plan}",
     ]
+    last = coach.runner.last_call
+    if last:
+        what = "question" if last["kind"] == "ask" else "plan"
+        if last["ok"]:
+            lines.append(f"• Last Claude call: ✅ worked, {fmt_when(last['at'])} ({what})")
+        else:
+            lines.append(f"• Last Claude call: ⚠️ failed, {fmt_when(last['at'])} ({what}): {last['message']}")
+    else:
+        lines.append("• Last Claude call: none since the bot started")
     if cfg.token_created:
-        expires = cfg.token_created + timedelta(days=365)
+        expires = coach.token_expires()
         left = (expires - coach.today()).days
         lines.append(f"• Token created {cfg.token_created}, expires about {expires} ({left} days left)")
     else:

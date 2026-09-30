@@ -649,3 +649,68 @@ def test_bot_env_example_parses(tmp_path):
     assert cfg.equipment_rotation == bot.parse_list(bot.DEFAULT_ROTATION)
     assert cfg.garmin_db == "/garmin/monitor.db" and cfg.garmin_profile == "Me"
     assert cfg.secrets == [BOT_TOKEN]  # empty token lines are not treated as secrets
+
+
+# ---------------------------------------------------------------------------
+# Fixes from the requirements review
+# ---------------------------------------------------------------------------
+
+
+async def test_next_week_build_tells_claude_which_week_it_is_planning(coach, claude, clock):
+    await coach.build_week(date(2026, 9, 28))
+    clock.set(2026, 10, 4, 20, 0)  # Sunday of week 1, building week 2
+    await coach.build_week(date(2026, 10, 5))
+    system = claude.last()["system"]
+    assert "The current week is week 1 of my programme" in system
+    assert "Its main equipment is dumbbells" in system
+    assert "You are now building the plan for a different week: week 2, the week of Monday 5 October 2026. Its main equipment is cables." in system
+    await coach.ask(OWNER, "hi")
+    assert "different week" not in claude.last()["system"]
+
+
+async def test_strength_day_without_numbered_exercises_is_fixed(coach, claude):
+    no_numbers = "\n".join(
+        [f"📅 {d}: " + ("Push\n• Dumbbell press 3 x 10" if d == "Monday" else "Rest") for d in bot.DAY_NAMES]
+    )
+    claude.enqueue({"result": no_numbers})
+    await coach.build_week(date(2026, 9, 28))
+    assert len(claude.plan_calls()) == 2
+    assert "Monday (Push) has no numbered exercises" in claude.plan_calls()[1]["stdin"]
+
+
+def test_basketball_and_swim_days_need_no_numbers(coach):
+    plan = "\n".join(f"📅 {d}: " + {"Friday": "Swim", "Saturday": "Basketball"}.get(d, "Rest") for d in bot.DAY_NAMES)
+    assert coach.plan_problems(plan) == []
+
+
+def test_landmine_push_press_is_allowed(cfg):
+    plan = "📅 Monday: Push\n1. Half kneeling landmine push press: 3 x 8"
+    assert bot.find_blocked(plan, cfg.blocked_movements, cfg.allowed_movements) == []
+
+
+async def test_status_shows_the_last_claude_call(app, claude):
+    status = (await send(app, "/status"))[0]
+    assert "Last Claude call: none since the bot started" in status
+    await send(app, "/ask hi")
+    status = (await send(app, "/status"))[0]
+    assert "Last Claude call: ✅ worked, Wed 30 Sep 12:00 (question)" in status
+    claude.enqueue({"mode": "auth"})
+    await send(app, "/ask hi")
+    status = (await send(app, "/status"))[0]
+    assert "Last Claude call: ⚠️ failed, Wed 30 Sep 12:00 (question): Claude Code could not sign in" in status
+
+
+async def test_week_on_saturday_explains_first(app, claude, clock):
+    await send(app, "/plan")
+    clock.set(2026, 10, 3, 10, 0)
+    week = "".join(await send(app, "/week"))
+    assert week.startswith("Next week's plan is not built yet.")
+    assert "Here is this week's plan until then." in week
+
+
+async def test_network_errors_get_a_plain_message(coach, claude):
+    # the exact shape Claude Code 2.1 prints when it cannot connect
+    claude.enqueue({"mode": "error_result", "result": "API Error: Connection refused — a firewall or proxy may be blocking it (ECONNREFUSED)"})
+    with pytest.raises(bot.ClaudeError) as err:
+        await coach.ask(OWNER, "hi")
+    assert "could not reach Anthropic's servers" in err.value.user_message
