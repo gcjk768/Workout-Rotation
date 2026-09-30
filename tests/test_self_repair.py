@@ -13,6 +13,7 @@ from telegram.error import Forbidden, RetryAfter
 
 import bot
 from conftest import BOT_TOKEN, OWNER, FakeTelegram, message_update
+from fake_bot_api import check_message
 
 
 def failing() -> Exception:
@@ -100,7 +101,9 @@ async def test_unexpected_error_is_diagnosed_and_repaired(app, claude, clock):
     assert "🩺 <b>Self repair</b>\nSomething went wrong in the /today command (TypeError)." in report
     assert "<b>What Claude found:</b> away.json is damaged." in report
     assert "<b>What I did:</b> I restored away.json from its last good copy." in report
-    assert "Your travel days were restored." in report and "Guard fmt_day against None." in report
+    assert "Your travel days were restored." in report
+    assert "<b>🛠 Suggested code change</b> <i>for the next update, tap to open</i>\n<blockquote expandable>Guard fmt_day against None.</blockquote>" in report
+    assert check_message({"text": report, "parse_mode": "HTML"}) is None
     assert store.read_json("away.json", None) == [{"from": "2026-10-08"}]
     health = store.read_json("health.json", {})
     assert health["last_problem"]["remedy"] == "repair_file" and health["last_problem"]["where"] == "the /today command"

@@ -3906,9 +3906,11 @@ class SelfRepair:
         text = f"{head}\n**What Claude found:** {result.get('diagnosis', '').strip()}\n**What I did:** {done}"
         if result.get("message", "").strip():
             text += f"\n\n{result['message'].strip()}"
-        if result.get("code_fix", "").strip():
-            text += f"\n\n**Suggested code change for the next update:** {result['code_fix'].strip()[:700]}"
-        await owner_send(self.ctx, text)
+        blocks = [to_html(text)]
+        if result.get("code_fix", "").strip():  # for a programmer, so it stays folded
+            blocks.append("<b>🛠 Suggested code change</b> <i>for the next update, tap to open</i>\n"
+                          f"<blockquote expandable>{_h(result['code_fix'].strip()[:1500])}</blockquote>")
+        await owner_send(self.ctx, blocks)
         if restart:
             global RESTART_REQUESTED
             RESTART_REQUESTED = True
