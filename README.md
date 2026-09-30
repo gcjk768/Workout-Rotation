@@ -133,7 +133,7 @@ Week 1 · dumbbells · building week 1 of 3
 - Exercises are grouped by body part, and each one shows sets × reps, the weight, the rest and the effort (RPE).
 - The cue, left arm note, form video, target muscles, tempo and a shoulder friendly swap sit in a collapsed quote. Tap it to open.
 - Supersets are labelled A1 and A2.
-- Friday shows the swim, the legs option and the run as separate sections.
+- Friday shows the swim, the legs option and the cardio block as separate sections.
 - The same cards arrive with the 07:00 message and the pre-gym reminder, followed by the Lighter and 30 minute buttons. Those buttons send back a card too: fewer sets, lighter weights and RPE 5 to 6, or the most important work fitted into 30 minutes. The same injury check runs on it, and your plan stays as it was.
 
 ## Reminders (Singapore time, set in `bot.env`)
