@@ -55,6 +55,12 @@ def run(api: FakeBotAPI, expect_garmin: bool = True, claude_version: str = "2.1.
     done.append("stranger gets only their ID")
 
     mark = api.mark()
+    api.message("/injury", OWNER)
+    notes = api.reply(OWNER, "njury notes", after=mark)["text"]
+    assert "cleared for everything" not in notes, notes
+    done.append("the stranger's /injury changed nothing")
+
+    mark = api.mark()
     api.message("/whoami", OWNER)
     api.reply(OWNER, f"<code>{OWNER}</code>", after=mark)
     done.append("/whoami")
@@ -120,10 +126,14 @@ def run(api: FakeBotAPI, expect_garmin: bool = True, claude_version: str = "2.1.
     done.append("/profile with shoulder trend")
 
     mark = api.mark()
-    api.message("hello from a group", OWNER, chat_id=-100777, chat_type="group")
-    time.sleep(1.5)
+    api.message("/today", OWNER, chat_id=-100777, chat_type="group")
+    api.message("/whoami", OWNER)  # handled after the group message, so its reply proves the order
+    api.reply(OWNER, f"<code>{OWNER}</code>", after=mark)
     assert not [c for c in api.calls[mark:] if c[0] == "sendMessage" and int(c[1].get("chat_id", 0)) == -100777]
     done.append("group messages ignored")
+
+    assert not api.errors, f"Telegram would have rejected: {api.errors}"
+    done.append("every message was valid for Telegram (HTML, length, buttons)")
     return done
 
 

@@ -132,6 +132,18 @@ def parse_date(value: str | None) -> date | None:
         raise ConfigError(f"Date '{raw}' should look like 2026-10-01") from exc
 
 
+def injury_blocked(env: dict) -> list[str]:
+    """The built-in list plus INJURY_EXTRA_BLOCKED, or nothing when INJURY_CHECK=off.
+
+    Older bot.env files with INJURY_BLOCKED_MOVEMENTS keep working: a list replaces the
+    built-in one and an empty value turns the check off."""
+    if _clean(env.get("INJURY_CHECK")).lower() in ("off", "no", "false", "0"):
+        return []
+    if "INJURY_BLOCKED_MOVEMENTS" in env:
+        return parse_list(env["INJURY_BLOCKED_MOVEMENTS"])
+    return parse_list(DEFAULT_BLOCKED) + parse_list(env.get("INJURY_EXTRA_BLOCKED"))
+
+
 def monday_of(day: date) -> date:
     return day - timedelta(days=day.weekday())
 
@@ -141,9 +153,14 @@ DEFAULT_BLOCKED = (
     "overhead * press, shoulder press, military * press, push press, arnold * press, z press, "
     "clean and press, behind the neck, upright * row, dip, wide grip * bench, barbell * bench, "
     "bench press, fly, flye, flies, pec deck, overhead * extension, overhead * carry, "
-    "overhead * squat, snatch, jerk, thruster, handstand, kipping"
+    "overhead * squat, snatch, jerk, thruster, handstand, kipping, ohp, strict press, behind * neck, "
+    "cable * crossover, pike push, high pull, squat to press, french press, incline barbell * press"
 )
 DEFAULT_ALLOWED = (
+    "pec deck rear delt * fly, pec deck reverse * fly, rear delt * fly on the pec deck, "
+    "reverse * fly on the pec deck, rear * fly on the pec deck, bent over * fly, "
+    "bench press with dumbbell, thoracic extension, fast dip, small dip, short dip, "
+    "shallow dip, slight dip, dip to a quarter squat, rowing on the erg, rowing machine, "
     "reverse * fly, reverse * flye, reverse * flies, rear delt * fly, rear delt * flye, "
     "rear delt * flies, rear * fly, rear * flye, rear * flies, reverse pec deck, "
     "rear delt pec deck, dumbbell * bench press, db * bench press, landmine * press, hip dip, "
@@ -253,9 +270,10 @@ class Config:
             equipment_rotation=rotation,
             program_start=program_start,
             training_days=parse_days(env.get("TRAINING_DAYS") or "Mon,Tue,Wed,Thu,Fri"),
-            # An empty INJURY_BLOCKED_MOVEMENTS= turns the check off; a missing one uses defaults.
-            blocked_movements=parse_list(env.get("INJURY_BLOCKED_MOVEMENTS", DEFAULT_BLOCKED)),
-            allowed_movements=parse_list(env.get("INJURY_ALLOWED_MOVEMENTS", DEFAULT_ALLOWED)),
+            blocked_movements=injury_blocked(env),
+            allowed_movements=parse_list(DEFAULT_ALLOWED)
+            + parse_list(env.get("INJURY_EXTRA_ALLOWED"))
+            + parse_list(env.get("INJURY_ALLOWED_MOVEMENTS")),  # older bot.env files
             reminder_mon_thu=parse_optional_time(env, "REMINDER_TIME_MON_THU", "17:30"),
             reminder_fri=parse_optional_time(env, "REMINDER_TIME_FRI", "17:00"),
             check_time=parse_optional_time(env, "CHECK_TIME", "21:00"),
@@ -634,8 +652,8 @@ def plan_exercises(text: str, include_rehab: bool = True) -> list[tuple[int, str
 # Words that introduce a movement the line is NOT doing: "Landmine press, swap for overhead
 # press" or "Push ups (not dips)". Only the phrase up to the next punctuation is removed.
 NEGATION_RE = re.compile(
-    r"\b(?:instead of|in place of|rather than|replac(?:es|ing|ement for)|(?:a )?swap(?:ped)? for|"
-    r"alternative to|not|no(?! more than| less than)|avoid(?:ing)?|skip(?:ping)?|without|never|"
+    r"\b(?:instead of|in place of|rather than|like an?|similar to|(?<!more )(?<!less )than|replac(?:es|ing|ement for)|(?:a )?swap(?:ped)?(?: in)? for|"
+    r"alternative to|not|no(?! more than| less than| rest\b)|zero|avoid(?:ing)?|skip(?:ping)?|without|never|"
     r"don'?t|do not)\b[^,.;:()?!\n]*",
     re.IGNORECASE,
 )
@@ -645,17 +663,20 @@ LEFT_OUT_RE = re.compile(
     r"^[\s*_•\->]*(?:"
     r"[^:\n]{0,40}\b(?:avoid\w*|leave out|left out|leaving out|not included|skip\w*|swaps|swap(?=[*_\s]*:)|"
     r"instead|replace\w*|off limits|banned)\b[^:\n]{0,30}[*_]*\s*:"
-    r"|(?:[^:\n]{1,30}:\s*)?[*_]*\s*(?:no(?! more than| less than)|avoid\w*|skip\w*|leave out|"
-    r"left out|leaving out|don'?t|do not|never|without|instead of|rather than|not)\b)",
+    r"|(?:[^:\n]{1,30}:\s*)?[*_]*\s*(?:no(?! more than| less than| rest\b)|avoid\w*|skip\w*|leave out|"
+    r"left out|leaving out|don'?t|do not|never|without|instead of|rather than|not(?! too\b))\b"
+    r"|.*\b(?:stays?|remains?) out\b|.*\b(?:once|until|when)\b.{0,20}\b(?:physio|doctor)\b)",
     re.IGNORECASE,
 )
 # In the allowed list a * may stand for up to two words, but never for words that start
 # a second exercise ("dumbbell pullover and barbell bench press").
-ALLOWED_GAP = r"(?:(?!(?:and|or|then|plus|with|barbell|bar|superset)\b)[\w'-]+\s+){0,2}?"
+ALLOWED_GAP = r"(?:(?!(?:and|or|then|plus|with|barbell|bar|superset)\b)[\w'-]+\s+){0,3}?"
 # In the blocked list a * may not jump across joining words ("sit upright and row").
 BLOCKED_GAP = r"(?:(?!(?:and|or|then|to|into|with|for|from|plus)\b)[\w'-]+\s+){0,2}?"
 SKIP_LINE_RE = re.compile(r"^[\s*_•\-]*(?:form\s+|coaching\s+)?(?:video|cues?)[*_]*\s*[:\-–]", re.IGNORECASE)
-SENTENCE_SPLIT_RE = re.compile(r"(?<=[.?!;])\s+")
+SENTENCE_SPLIT_RE = re.compile(r"(?<=[.?!;])\s+|,\s*(?=(?:so|but|then|instead)\b)", re.IGNORECASE)
+# "(overhead press alternative)", "(dip replacement)": the move is named, not prescribed.
+ALT_NOUN_RE = re.compile(r"[\s-]+(?:alternatives?|replacements?|substitutes?|subs?|swaps?)\b", re.IGNORECASE)
 
 
 def _term_regex(term: str, gap: str = BLOCKED_GAP) -> re.Pattern:
@@ -664,7 +685,10 @@ def _term_regex(term: str, gap: str = BLOCKED_GAP) -> re.Pattern:
         if word == "*":
             parts.append(gap)
         else:  # plurals and -ing forms: dip/dips, tricep/triceps, press/pressing
-            suffix = r"(?:e?s)?" if word.endswith("y") or word.endswith("e") else r"(?:e?s|ing)?"
+            if word.endswith("y"):  # fly/flys/flyes/flies, carry/carries
+                parts.append(re.escape(word[:-1]) + r"(?:y(?:e?s)?|ies)\b[\s-]*")
+                continue
+            suffix = r"(?:e?s)?" if word.endswith("e") else r"(?:e?s|ing)?"
             parts.append(re.escape(word) + suffix + r"\b[\s-]*")
     body = "".join(parts)
     body = body[: -len(r"[\s-]*")] if body.endswith(r"[\s-]*") else body
@@ -673,7 +697,8 @@ def _term_regex(term: str, gap: str = BLOCKED_GAP) -> re.Pattern:
 
 def _clauses(line: str) -> list[str]:
     """Sentences of a line, with anything in brackets checked as its own clause."""
-    line = YT_TAG_RE.sub(" ", line).replace("**", " ").replace("__", " ")
+    line = YT_TAG_RE.sub(" ", line).replace("**", " ").replace("__", " ").replace("\u2019", "'")
+    line = re.sub(r"\s[&+]\s", " and ", line)
     out = []
     for sentence in SENTENCE_SPLIT_RE.split(line):
         out.extend(re.findall(r"\(([^)]*)\)", sentence))
@@ -690,20 +715,28 @@ def find_blocked(text: str, blocked: list[str], allowed: list[str]) -> list[dict
     are removed, and what is left is searched for blocked movements.
     """
     blocked_res = [(term, _term_regex(term)) for term in blocked]
-    allowed_res = [_term_regex(term, ALLOWED_GAP) for term in allowed]
+    allowed_res = [_term_regex(term, ALLOWED_GAP) for term in sorted(set(allowed), key=len, reverse=True)]
     hits = []
     for day in parse_plan(text).days.values():
         for line in day.text.splitlines():
             if not line.strip() or DAY_HEADER_RE.match(line) or SKIP_LINE_RE.match(line):
                 continue
             found = None
-            for clause in _clauses(line):
-                if LEFT_OUT_RE.match(clause):
+            checks = [(clause, True) for clause in _clauses(line)]
+            entry = exercise_entry(line)
+            if entry:  # "1. Bench dips: no added weight" names the move even if a cue follows
+                checks.insert(0, (_clauses(entry[0])[-1], False))
+            for clause, may_skip in checks:
+                if may_skip and LEFT_OUT_RE.match(clause):
                     continue
                 check = NEGATION_RE.sub(" ", clause)
                 for pattern in allowed_res:
                     check = pattern.sub(" ", check)
-                found = next((term for term, pattern in blocked_res if pattern.search(check)), None)
+                found = next(
+                    (term for term, pattern in blocked_res
+                     if any(not ALT_NOUN_RE.match(check, m.end()) for m in pattern.finditer(check))),
+                    None,
+                )
                 if found:
                     break
             if found:
@@ -840,13 +873,15 @@ def to_html(text: str) -> str:
         line = YT_TAG_RE.sub(
             lambda m: stash(
                 f'<a href="{html.escape(yt_search_url(unstash(m.group(1))))}">'
-                f"▶️ {html.escape(unstash(m.group(1)).strip(), quote=False)}</a>"
+                f"▶️ {html.escape(unstash(m.group(1)).strip(), quote=False)}</a>",
+                "▶️ " + unstash(m.group(1)).strip(),
             ),
             line,
         )
         line = MD_LINK_RE.sub(
             lambda m: stash(
-                f'<a href="{html.escape(unstash(m.group(2)))}">{html.escape(unstash(m.group(1)), quote=False)}</a>'
+                f'<a href="{html.escape(unstash(m.group(2)))}">{html.escape(unstash(m.group(1)), quote=False)}</a>',
+                unstash(m.group(1)),
             ),
             line,
         )
@@ -1592,15 +1627,17 @@ class Coach:
         summary = self.garmin_summary(today)
         return summary.short[:1].upper() + summary.short[1:] + "."
 
-    def recovery_note(self, today: date) -> str | None:
-        """A heads up for the session reminder when Garmin shows poor recovery."""
+    def recovery_note(self, today: date, rest_day: bool = False) -> str | None:
+        """A heads up for the day's message when Garmin shows poor recovery."""
         flags = self.garmin_summary(today).recovery_flags
         if not flags:
             return None
-        return (
-            "⚠️ Your Garmin data says recovery looks low today: " + ", ".join(flags) + ". "
-            "Go lighter today, or ask me for a lighter version of this session."
+        advice = (
+            "Good timing for a rest day. Keep it easy and get an early night."
+            if rest_day
+            else "Go lighter today, or tap Lighter version below."
         )
+        return "⚠️ Your Garmin data says recovery looks low today: " + ", ".join(flags) + ". " + advice
 
     def tz_label(self) -> str:
         return "Singapore time" if str(self.cfg.tz) == "Asia/Singapore" else f"{self.cfg.tz} time"
@@ -2588,6 +2625,8 @@ async def send_day_session(context: ContextTypes.DEFAULT_TYPE, heading: str, res
             return
         if coach.program_start() > monday:
             return  # the programme starts next week (first plan built with /nextweek)
+        if today.weekday() > 4:
+            return  # like the catch up: no Claude build for a week that is nearly over
         try:
             await coach.build_week(monday, kind="build", wait=True, keep_if=lambda meta: True)
         except ClaudeError as exc:
@@ -2602,7 +2641,7 @@ async def send_day_session(context: ContextTypes.DEFAULT_TYPE, heading: str, res
     else:
         text = f"{heading}\n\n{day.text}"
         markup = alt_keyboard(today)
-    note = coach.recovery_note(today)
+    note = coach.recovery_note(today, rest_day=bool(day and day.is_rest))
     if note:
         text += "\n\n" + note
     await owner_send(context, text, reply_markup=markup)
@@ -2618,6 +2657,22 @@ async def on_alt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except ValueError:
         await query.answer()
         return
+    if day != coach.today():
+        await query.answer(f"That button was for {fmt_day(day)}. Send /today for today's session.", show_alert=True)
+        return
+    busy = context.application.bot_data.setdefault("alt_busy", set())
+    if query.data in busy:
+        await query.answer("Already asking your coach…")
+        return
+    busy.add(query.data)
+    try:
+        await _answer_alt(update, context, coach, day, kind)
+    finally:
+        busy.discard(query.data)
+
+
+async def _answer_alt(update, context, coach, day, kind) -> None:
+    query = update.callback_query
     await query.answer("Asking your coach…")
     plan = coach.store.load_plan(monday_of(day)) or ""
     focus = getattr(parse_plan(plan).days.get(day.weekday()), "focus", "")

@@ -107,7 +107,7 @@ If the bot was off at a reminder time, it catches up when it starts. It sends a 
   - Each day starts with a line like `📅 Monday: Push`, which is how `/today` finds the right day.
   - The split chosen in week 1 is saved and sent back to Claude every week.
   - Exercises from the two previous weeks are listed so none repeat. Rehab exercises may repeat.
-- **Injury check.** The plan checker uses `INJURY_BLOCKED_MOVEMENTS`. Empty that setting once your physio clears you.
+- **Injury check.** Every line of every day is checked for movements your injury rules leave out, including warm-ups, finishers, options and text in brackets. Lines that only list what to avoid ("no overhead pressing, dips or upright rows") and swaps ("landmine press instead of overhead press") are not flagged. The built-in lists live in `bot.py`, so they improve with updates. Add your own with `INJURY_EXTRA_BLOCKED` and `INJURY_EXTRA_ALLOWED`, and set `INJURY_CHECK=off` once your physio clears you.
 - **Garmin.** garmin-monitor's `monitor.db` is opened read-only and never written to.
 - **Log safety.** Tokens are never logged. The `httpx` logger is set to WARNING because it prints the bot token in request URLs, and every log line is filtered for secrets.
 
@@ -135,11 +135,8 @@ pip install -r requirements.txt pytest pytest-asyncio
 python -m pytest
 ```
 
-`tests/test_e2e_process.py` starts the real `python bot.py` process against a stand-in Bot API (`tests/fake_bot_api.py`). It long-polls, sends commands and presses buttons, then stops the bot with SIGTERM the way Docker does. You can run the same scenario against a running container:
+`tests/test_e2e_process.py` starts the real `python bot.py` process against a stand-in Bot API (`tests/fake_bot_api.py`). It long-polls, sends commands and presses buttons, then stops the bot with SIGTERM the way Docker does. The stand-in rejects anything real Telegram would reject: broken HTML, messages over 4096 characters and button data over 64 bytes. So a formatting bug fails the test instead of hiding.
 
-1. Start the stand-in: `python tests/e2e_scenario.py --serve 8090`
-2. Point the bot at it: set `TELEGRAM_BASE_URL=http://127.0.0.1:8090` and run the container with host networking.
-
-`TELEGRAM_BASE_URL` is empty in normal use, which means api.telegram.org.
+`TELEGRAM_BASE_URL` stays empty in normal use, which means api.telegram.org. It exists for a local Bot API server and for these tests. Never point your real bot at the stand-in: it only accepts the test token from `tests/e2e_scenario.py`.
 
 To try the Garmin summary with sample data: `python tests/sample_garmin.py /tmp/monitor.db 2026-09-30`.
