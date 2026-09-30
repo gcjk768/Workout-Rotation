@@ -17,12 +17,18 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import sqlite3
 import tempfile
+import threading
+import time
+import traceback
+from collections import deque
 from datetime import date, datetime, timedelta
 from datetime import time as dtime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import quote, quote_plus
 from zoneinfo import ZoneInfo
@@ -38,7 +44,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction, ChatType, ParseMode
-from telegram.error import BadRequest, NetworkError
+from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -308,6 +314,7 @@ class Config:
     holidays_country: str = "SG"
     safety_review: bool = True
     structured_plans: bool = True
+    self_repair: bool = True
     claude_retry_delay: float = 5.0
     ask_timeout: int = 240
     plan_timeout: int = 600
@@ -392,6 +399,7 @@ class Config:
             holidays_country=get("HOLIDAYS_COUNTRY", "SG") if "HOLIDAYS_COUNTRY" not in env else _clean(env["HOLIDAYS_COUNTRY"]),
             safety_review=parse_switch(env.get("SAFETY_REVIEW"), True),
             structured_plans=parse_switch(env.get("STRUCTURED_PLANS"), True),
+            self_repair=parse_switch(env.get("SELF_REPAIR"), True),
             claude_retry_delay=float(get("CLAUDE_RETRY_DELAY", "5")),
             secrets=[
                 v
@@ -432,13 +440,28 @@ def redact(text: str, secrets: list[str] | None = None) -> str:
     return text
 
 
+class RecentLog(logging.Handler):
+    """The last warnings and errors, for self repair to show Claude."""
+
+    def __init__(self, size: int = 40):
+        super().__init__(logging.WARNING)
+        self.lines: deque[str] = deque(maxlen=size)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        with contextlib.suppress(Exception):
+            self.lines.append(self.format(record)[:600])
+
+
+RECENT_LOG = RecentLog()
+
+
 def setup_logging(cfg: Config) -> None:
+    formatter = RedactingFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s", cfg.secrets)
     handler = logging.StreamHandler()
-    handler.setFormatter(
-        RedactingFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s", cfg.secrets)
-    )
+    handler.setFormatter(formatter)
+    RECENT_LOG.setFormatter(formatter)
     root = logging.getLogger()
-    root.handlers[:] = [handler]
+    root.handlers[:] = [handler, RECENT_LOG]
     root.setLevel(logging.INFO)
     # httpx logs every request URL at INFO, and those URLs contain the bot token.
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -456,15 +479,25 @@ class Store:
 
     def __init__(self, data_dir: Path):
         self.root = Path(data_dir)
+        self.repairs: list[dict] = []  # damaged files repaired since the last self check
         for sub in ("plans", "plans/history", "checkins"):
             (self.root / sub).mkdir(parents=True, exist_ok=True)
 
     # -- helpers ------------------------------------------------------------
 
     def _write(self, path: Path, text: str) -> None:
+        """Write to a temporary file, flush it to disk, then swap it in, so a power cut
+        leaves either the old or the new file. JSON files keep the last good version as .bak."""
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(text, encoding="utf-8")
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if path.suffix == ".json" and path.exists():
+            with contextlib.suppress(OSError, ValueError):
+                json.loads(path.read_text(encoding="utf-8"))  # only a good file becomes the backup
+                shutil.copyfile(path, path.with_name(path.name + ".bak"))
         os.replace(tmp, path)
 
     def read_json(self, name: str, default: Any) -> Any:
@@ -473,9 +506,36 @@ class Store:
             return default
         try:
             return json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except ValueError:
+            return self.repair_file(path, default)
+        except OSError:
             log.exception("Could not read %s, using an empty value", path)
             return default
+
+    def repair_file(self, path: Path, default: Any = None) -> Any:
+        """A damaged JSON file: move it to data/broken and restore the backup, if it is good."""
+        broken = self.root / "broken"
+        broken.mkdir(exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        with contextlib.suppress(OSError):
+            os.replace(path, broken / f"{path.name}.{stamp}")
+        backup = path.with_name(path.name + ".bak")
+        try:
+            text = backup.read_text(encoding="utf-8")
+            data = json.loads(text)
+        except (OSError, ValueError):
+            log.error("%s was damaged and has no good backup, so it starts empty", path)
+            self.repairs.append({"file": self.name_of(path), "restored": False})
+            return default
+        self._write(path, text)
+        log.warning("%s was damaged, restored the backup", path)
+        self.repairs.append({"file": self.name_of(path), "restored": True})
+        return data
+
+    def name_of(self, path: Path) -> str:
+        with contextlib.suppress(ValueError):
+            return str(path.relative_to(self.root))
+        return path.name
 
     def write_json(self, name: str, data: Any) -> None:
         self._write(self.root / name, json.dumps(data, indent=2, ensure_ascii=False))
@@ -3535,7 +3595,7 @@ async def status_text(coach: Coach, application: Application) -> str:
     ]
     last = coach.runner.last_call
     if last:
-        what = {"ask": "question", "day": "workout"}.get(last["kind"], "plan")
+        what = {"ask": "question", "day": "workout", "repair": "self repair"}.get(last["kind"], "plan")
         if last["ok"]:
             lines.append(f"• Last Claude call: ✅ worked, {fmt_when(last['at'])} ({what})")
         else:
@@ -3580,7 +3640,21 @@ async def status_text(coach: Coach, application: Application) -> str:
 def status_extra(coach: Coach) -> list[str]:
     summary = coach.garmin_summary(coach.today())
     icon = "✅" if summary.ok else "⚠️"
-    return ["", "**Garmin**", f"• {icon} Profile {coach.cfg.garmin_profile}: {summary.short}"]
+    lines = ["", "**Garmin**", f"• {icon} Profile {coach.cfg.garmin_profile}: {summary.short}"]
+    health = coach.store.read_json("health.json", {})
+    now = coach.now()
+    starts = [t for t in health.get("starts", []) if now - datetime.fromisoformat(t) < timedelta(days=7)]
+    lines += ["", "**Self repair**"]
+    if health.get("started_at"):
+        lines.append(f"• Running since {fmt_when(datetime.fromisoformat(health['started_at']))}, "
+                     f"{len(starts)} start{'s' if len(starts) != 1 else ''} in the last 7 days")
+    problem = health.get("last_problem")
+    if problem:
+        lines.append(f"• Last problem: {fmt_when(datetime.fromisoformat(problem['at']))} in {problem['where']}, "
+                     f"remedy: {problem['remedy']}")
+    else:
+        lines.append("• No problems so far")
+    return lines
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3594,15 +3668,403 @@ async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update is None and isinstance(context.error, NetworkError):
-        log.warning("Telegram network problem, retrying: %s", context.error)
+    error = context.error
+    if update is None and isinstance(error, NetworkError):
+        log.warning("Telegram network problem, retrying: %s", error)
         return
-    log.error("Unhandled error", exc_info=context.error)
+    if isinstance(error, (RetryAfter, Forbidden)):  # Telegram asked to slow down, or the chat blocked the bot
+        log.warning("Telegram refused a message: %s", error)
+        return
+    log.error("Unhandled error", exc_info=error)
     if isinstance(update, Update) and update.effective_chat:
         with contextlib.suppress(Exception):
             await context.bot.send_message(
-                update.effective_chat.id, "Sorry, something went wrong on my side. Please try again."
+                update.effective_chat.id,
+                "Sorry, something went wrong on my side. I am looking into it and will tell you what I find.",
             )
+    repair = getattr(context, "application", None) and context.application.bot_data.get("repair")
+    if repair and error is not None:
+        job = getattr(context, "job", None)
+        try:
+            await repair.handle(error, describe_source(update, job), job)
+        except Exception:  # noqa: BLE001 - self repair must never take the bot down
+            log.exception("Self repair failed")
+
+
+def describe_source(update: object, job) -> str:
+    if job is not None:
+        return f"the {JOB_LABELS.get(job.name, job.name)} reminder"
+    if isinstance(update, Update):
+        if update.callback_query:
+            return f"a button ({(update.callback_query.data or '').split(':')[0]})"
+        text = (update.effective_message.text or "") if update.effective_message else ""
+        if text.startswith("/"):
+            return f"the {text.split()[0].split('@')[0]} command"
+        return "a chat message"
+    return "the bot"
+
+
+# ---------------------------------------------------------------------------
+# Self repair: stay alive, fix what can be fixed, and tell the owner
+# ---------------------------------------------------------------------------
+
+WATCHDOG_LIMIT = 600  # seconds without a heartbeat before the bot restarts itself
+REMEDIES = {
+    "none": "Change nothing. The error was a one off, or only a code update can fix it.",
+    "retry": "Run the failed reminder again in 2 minutes. Only for errors in a scheduled reminder.",
+    "repair_file": "A data file is damaged: move it aside and restore its last good backup. Put its path, relative to the data folder, in file.",
+    "clear_memory": "The chat memory is damaged or too large: clear it.",
+    "clean_work": "Empty Claude Code's work folder (/work).",
+    "rebuild_plan": "This week's plan is damaged or unreadable: build it again.",
+    "restart": "Restart the bot. Docker starts it again within a minute.",
+}
+REPAIR_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "diagnosis": {"type": "string", "description": "what went wrong and why, in one or two sentences"},
+        "remedy": {"type": "string", "enum": list(REMEDIES)},
+        "file": {"type": "string", "description": "for repair_file only"},
+        "message": {"type": "string", "description": "one to three short plain sentences for the owner"},
+        "code_fix": {"type": "string", "description": "the smallest code change that stops it happening again, or empty"},
+    },
+    "required": ["diagnosis", "remedy", "message"],
+}
+REPAIR_MARK = "SELF REPAIR"
+MAX_DIAGNOSES_PER_DAY = 6
+RESTART_REQUESTED = False  # set by a self repair restart, so main() exits with an error code
+
+
+def heartbeat_age() -> float | None:
+    try:
+        return time.time() - HEARTBEAT.stat().st_mtime
+    except OSError:
+        return None
+
+
+def start_watchdog(store: "Store", limit: float = WATCHDOG_LIMIT, interval: float = 60, exit_fn=os._exit) -> threading.Thread:
+    """A thread outside the event loop. If the heartbeat job stops for `limit` seconds, the
+    loop is stuck, so the process exits and Docker's restart policy starts it again."""
+
+    started = time.time()
+
+    def loop() -> None:
+        while True:
+            time.sleep(interval)
+            age = heartbeat_age()
+            age = min(age if age is not None else float("inf"), time.time() - started)  # an old file does not count
+            if age > limit:
+                log.critical("No heartbeat for %.0f seconds, the bot looks stuck. Restarting.", age)
+                with contextlib.suppress(Exception):
+                    note_exit(store, f"it stopped responding for {round(age / 60)} minutes")
+                exit_fn(1)
+                return
+
+    thread = threading.Thread(target=loop, name="watchdog", daemon=True)
+    thread.start()
+    return thread
+
+
+def note_exit(store: "Store", reason: str) -> None:
+    """Why the bot is about to stop, for the message after the restart."""
+    health = store.read_json("health.json", {})
+    health["exit_reason"] = reason
+    store.write_json("health.json", health)
+
+
+class SelfRepair:
+    """Unexpected errors go to `claude -p` (no tools) for a diagnosis. Claude picks one remedy
+    from REMEDIES, the bot carries it out and tells the owner. Claude never changes files
+    or code itself; a code fix is only suggested in the message."""
+
+    def __init__(self, application: Application, coach: Coach):
+        self.app = application
+        self.ctx = SimpleNamespace(bot=application.bot, application=application, job=None)  # for owner_send
+        self.coach = coach
+        self.store = coach.store
+        self.restart = lambda: application.stop_running()
+
+    def health(self) -> dict:
+        return self.store.read_json("health.json", {})
+
+    def save_health(self, health: dict) -> None:
+        self.store.write_json("health.json", health)
+
+    @staticmethod
+    def signature(error: BaseException) -> str:
+        frames = [f for f in traceback.extract_tb(error.__traceback__) if f.filename.endswith("bot.py")]
+        where = f"{frames[-1].name}:{frames[-1].lineno}" if frames else "?"
+        return f"{type(error).__name__}@{where}"
+
+    def details(self, error: BaseException) -> tuple[str, str]:
+        """(traceback, source lines around the bot.py frames), secrets removed."""
+        secrets = self.coach.cfg.secrets
+        tb = redact("".join(traceback.format_exception(type(error), error, error.__traceback__)), secrets)[-4000:]
+        frames = [f for f in traceback.extract_tb(error.__traceback__) if f.filename.endswith("bot.py")][-3:]
+        source = []
+        with contextlib.suppress(OSError):
+            lines = Path(__file__).read_text(encoding="utf-8").splitlines()
+            for frame in frames:
+                lo, hi = max(1, frame.lineno - 8), min(len(lines), frame.lineno + 6)
+                body = "\n".join(f"{n}{'>' if n == frame.lineno else ' '} {lines[n - 1]}" for n in range(lo, hi + 1))
+                source.append(f"{frame.name}(), bot.py lines {lo} to {hi}:\n{body}")
+        return tb, redact("\n\n".join(source), secrets)
+
+    def data_files(self) -> str:
+        root = self.store.root
+        names = []
+        for path in sorted(root.rglob("*")):
+            if path.is_file() and "history" not in path.parts and "broken" not in path.parts:
+                names.append(f"{path.relative_to(root)} ({path.stat().st_size} bytes)")
+        return ", ".join(names[:60]) or "none"
+
+    async def diagnose(self, error: BaseException, where: str) -> dict:
+        tb, source = self.details(error)
+        system = (
+            "You are the on call engineer for a small Python Telegram bot: python-telegram-bot 22 with "
+            "its job queue, calling `claude -p` for its AI, running in Docker on a home NAS with its "
+            "files in /data. You cannot run commands or change files. The bot carries out the one "
+            "remedy you choose."
+        )
+        message = "\n".join([
+            REPAIR_MARK,
+            f"The bot hit an error in {where}. Diagnose it and choose one remedy.",
+            "",
+            f"Error: {type(error).__name__}: {redact(str(error), self.coach.cfg.secrets)[:500]}",
+            "",
+            "Traceback:",
+            tb,
+            "",
+            "Source around the failing lines:",
+            source or "(not available)",
+            "",
+            "Recent warnings and errors from the log:",
+            "\n".join(RECENT_LOG.lines) or "(none)",
+            "",
+            f"Files in the data folder: {self.data_files()}",
+            "",
+            "Remedies:",
+            *[f"- {name}: {text}" for name, text in REMEDIES.items()],
+            "",
+            "Choose the smallest remedy that fixes it. Choose restart only when the bot looks stuck "
+            "or broken in memory. When the cause is a bug in the code, choose none (or retry when a "
+            "second try can work) and put the smallest code change in code_fix. message is for the "
+            "bot's owner, who is not a programmer: plain words, no code.",
+        ])
+        reply = await self.coach.runner.run(system, message, "repair", REPAIR_SCHEMA)
+        data = json.loads(reply)
+        if not isinstance(data, dict) or data.get("remedy") not in REMEDIES:
+            raise ValueError("unexpected reply")
+        return data
+
+    async def handle(self, error: BaseException, where: str, job=None) -> None:
+        now = self.coach.now()
+        sig = self.signature(error)
+        self.store._append_jsonl("errors.jsonl", {
+            "at": now.isoformat(timespec="seconds"), "where": where, "signature": sig,
+            "error": redact(f"{type(error).__name__}: {error}", self.coach.cfg.secrets)[:500],
+        })
+        health = self.health()
+        seen = {k: v for k, v in health.get("diagnosed", {}).items()
+                if now - datetime.fromisoformat(v) < timedelta(days=7)}
+        health["diagnosed"] = seen
+        last = seen.get(sig)
+        if last and now - datetime.fromisoformat(last) < timedelta(hours=12):
+            return  # the same problem was diagnosed recently; it is in errors.jsonl
+        today = now.date().isoformat()
+        count = health.get("diagnoses_today", {})
+        if count.get("date") != today:
+            count = {"date": today, "count": 0}
+        if count["count"] >= MAX_DIAGNOSES_PER_DAY:
+            return
+        count["count"] += 1
+        health["diagnoses_today"] = count
+        seen[sig] = now.isoformat(timespec="seconds")
+        self.save_health(health)
+        head = f"🩺 **Self repair**\nSomething went wrong in {where} ({type(error).__name__})."
+        if not self.coach.cfg.self_repair:
+            self.record(now, where, sig, "none", "")
+            await owner_send(self.ctx, f"{head}\nThe details are saved in data/errors.jsonl.")
+            return
+        try:
+            result = await self.diagnose(error, where)
+        except Exception as exc:  # noqa: BLE001 - the owner still hears about the first error
+            if isinstance(exc, ClaudeError):
+                reason = exc.user_message
+            elif isinstance(exc, ValueError):
+                reason = "its answer was unreadable."
+            else:
+                reason = f"that failed too ({type(exc).__name__})."
+                log.exception("The self repair diagnosis failed")
+            self.record(now, where, sig, "none", "")
+            await owner_send(self.ctx, f"{head}\nI could not ask Claude to look at it: {reason} "
+                                       "The details are saved in data/errors.jsonl.")
+            return
+        done, restart = await self.apply(result, job)
+        self.record(now, where, sig, result["remedy"], result.get("diagnosis", ""))
+        text = f"{head}\n**What Claude found:** {result.get('diagnosis', '').strip()}\n**What I did:** {done}"
+        if result.get("message", "").strip():
+            text += f"\n\n{result['message'].strip()}"
+        if result.get("code_fix", "").strip():
+            text += f"\n\n**Suggested code change for the next update:** {result['code_fix'].strip()[:700]}"
+        await owner_send(self.ctx, text)
+        if restart:
+            global RESTART_REQUESTED
+            RESTART_REQUESTED = True
+            note_exit(self.store, f"self repair: {result.get('diagnosis', '')[:150]}")
+            self.restart()
+
+    def record(self, now: datetime, where: str, sig: str, remedy: str, diagnosis: str) -> None:
+        health = self.health()
+        health["last_problem"] = {"at": now.isoformat(timespec="minutes"), "where": where, "signature": sig,
+                                  "remedy": remedy, "diagnosis": diagnosis[:300]}
+        self.save_health(health)
+
+    async def apply(self, result: dict, job) -> tuple[str, bool]:
+        """Carry out the chosen remedy. Returns (what was done, restart now)."""
+        remedy = result["remedy"]
+        store, coach = self.store, self.coach
+        if remedy == "retry":
+            if job is None or self.app.job_queue is None:
+                return "Nothing. It was not a reminder, so there is nothing to run again.", False
+            self.app.job_queue.run_once(job.callback, when=120, data=job.data, name=f"{job.name}_retry",
+                                        chat_id=job.chat_id, user_id=job.user_id)
+            return "I will run it again in 2 minutes.", False
+        if remedy == "repair_file":
+            name = (result.get("file") or "").strip().lstrip("/").removeprefix("data/")
+            path = (store.root / name).resolve()
+            if not name or store.root.resolve() not in path.parents or path.suffix != ".json" or not path.is_file():
+                return f"Nothing. I could not find a data file called {name or 'that'}.", False
+            store.repair_file(path)
+            restored = store.repairs[-1]["restored"] if store.repairs else False
+            store.repairs.clear()
+            return (f"I restored {name} from its last good copy." if restored
+                    else f"{name} had no good copy, so it starts empty. The damaged one is in data/broken."), False
+        if remedy == "clear_memory":
+            store.write_json("memory.json", {})
+            return "I cleared the chat memory.", False
+        if remedy == "clean_work":
+            removed = clean_folder(coach.cfg.work_dir, older_than=0)
+            return f"I emptied the work folder ({removed} items).", False
+        if remedy == "rebuild_plan":
+            health = self.health()
+            monday = monday_of(coach.today())
+            if health.get("rebuilt_plan") == monday.isoformat():
+                return "Nothing. I already rebuilt this week's plan once, so please send /plan.", False
+            health["rebuilt_plan"] = monday.isoformat()
+            self.save_health(health)
+            try:
+                await coach.build_week(monday, kind="repair", wait=True)
+            except ClaudeError as exc:
+                return f"I tried to rebuild this week's plan, but it failed: {exc.user_message}", False
+            return "I rebuilt this week's plan. Send /week to see it.", False
+        if remedy == "restart":
+            now = coach.now()
+            starts = [datetime.fromisoformat(t) for t in self.health().get("starts", [])]
+            if sum(1 for t in starts if now - t < timedelta(hours=6)) >= 3:
+                return "Nothing. I already restarted 3 times in 6 hours, so a restart will not help.", False
+            return "I am restarting. I will be back within a minute.", True
+        return "Nothing needed changing.", False
+
+    # -- the self check every 30 minutes --------------------------------------
+
+    def self_check(self) -> list[tuple[str, str]]:
+        """Deterministic checks and fixes. Returns (key, message) for problems to report."""
+        store, cfg = self.store, self.coach.cfg
+        problems: list[tuple[str, str]] = []
+        with contextlib.suppress(OSError):
+            free = shutil.disk_usage(store.root).free
+            if free < 200 * 1024 * 1024:
+                problems.append(("disk", f"💾 The NAS disk that holds ./data has only {free // (1024 * 1024)} MB free. "
+                                         "I stop being able to save your logs when it is full."))
+        try:
+            probe = store.root / ".write-test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+        except OSError as exc:
+            problems.append(("write", f"💾 I cannot save files in ./data ({exc.strerror or exc}). Check the folder "
+                                      "permissions and PUID/PGID in bot.env."))
+        for path in [*store.root.glob("*.json"), *(store.root / "plans").glob("*.json")]:
+            store.read_json(store.name_of(path), None)  # a damaged file is repaired as it is read
+        for fix in store.repairs:
+            if fix["restored"]:
+                problems.append((f"file:{fix['file']}", f"🩹 {fix['file']} was damaged, so I restored its last good copy."))
+            else:
+                problems.append((f"file:{fix['file']}", f"🩹 {fix['file']} was damaged and had no good copy, so it "
+                                                        "starts empty. The damaged one is in data/broken."))
+        store.repairs.clear()
+        clean_folder(cfg.work_dir, older_than=3600)
+        for leftover in Path(tempfile.gettempdir()).glob("coach-system-*.md"):
+            with contextlib.suppress(OSError):
+                if time.time() - leftover.stat().st_mtime > 3600:
+                    leftover.unlink()
+        return problems
+
+
+def clean_folder(folder: Path, older_than: float) -> int:
+    """Remove what is in the folder (files and folders older than `older_than` seconds)."""
+    removed = 0
+    if not folder.is_dir():
+        return 0
+    for item in folder.iterdir():
+        with contextlib.suppress(OSError):
+            if time.time() - item.lstat().st_mtime < older_than:
+                continue
+            if item.is_dir() and not item.is_symlink():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+            removed += 1
+    return removed
+
+
+async def job_self_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    repair: SelfRepair | None = context.application.bot_data.get("repair")
+    if repair is None:
+        return
+    problems = repair.self_check()
+    if not problems:
+        return
+    health = repair.health()
+    told = health.setdefault("told", {})
+    today = repair.coach.today().isoformat()
+    new = [(key, text) for key, text in problems if told.get(key) != today or key.startswith("file:")]
+    for key, _ in new:
+        told[key] = today
+    repair.save_health(health)
+    if new:
+        await owner_send(context, "\n\n".join(text for _, text in new))
+
+
+async def job_restart_notice(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """After an unexpected stop, tell the owner the bot is back and why it stopped."""
+    reason = (context.job.data or {}).get("reason") if context.job else None
+    text = "♻️ I restarted after an unexpected stop"
+    text += f" ({reason})." if reason else ", possibly a crash, a memory limit or a NAS restart."
+    text += " I am running again, and anything I missed is being caught up."
+    await owner_send(context, text)
+
+
+def mark_start(store: Store, now: datetime) -> dict | None:
+    """Record this start. Returns {"reason": ...} when the last run did not stop cleanly."""
+    health = store.read_json("health.json", {})
+    unexpected = None
+    if health.get("running") or health.get("exit_reason"):
+        unexpected = {"reason": health.get("exit_reason")}
+    starts = [t for t in health.get("starts", []) if now - datetime.fromisoformat(t) < timedelta(days=7)]
+    health.update(running=True, started_at=now.isoformat(timespec="seconds"),
+                  starts=[*starts, now.isoformat(timespec="seconds")][-50:])
+    health.pop("exit_reason", None)
+    store.write_json("health.json", health)
+    return unexpected
+
+
+async def post_shutdown(application: Application) -> None:
+    """A clean stop (docker stop, a NAS shutdown): no restart message next time."""
+    coach: Coach = application.bot_data["coach"]
+    health = coach.store.read_json("health.json", {})
+    health["running"] = False
+    health["stopped_at"] = coach.now().isoformat(timespec="seconds")
+    coach.store.write_json("health.json", health)
 
 
 # ---------------------------------------------------------------------------
@@ -3614,6 +4076,9 @@ async def post_init(application: Application) -> None:
     await application.bot.set_my_commands([BotCommand(name, desc) for name, desc in COMMANDS])
     coach: Coach = application.bot_data["coach"]
     beat()
+    unexpected = mark_start(coach.store, coach.now())
+    if unexpected is not None and application.job_queue:
+        application.job_queue.run_once(job_restart_notice, 10, data=unexpected, name="restart_notice")
     for leftover in Path(tempfile.gettempdir()).glob("coach-system-*.md"):
         with contextlib.suppress(OSError):
             leftover.unlink()  # left behind if the container was killed mid call
@@ -3652,7 +4117,7 @@ def add_handlers(application: Application, concurrent: bool = True) -> None:
     application.add_handler(
         MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_text, **slow)
     )
-    application.add_error_handler(on_error)
+    application.add_error_handler(on_error, block=not concurrent)  # a diagnosis takes a minute
 
 
 # ---------------------------------------------------------------------------
@@ -3990,19 +4455,24 @@ def schedule_jobs(application: Application) -> None:
     jq.run_daily(job_token_check, at(cfg.token_check_time), name="token_check", **daily)
     jq.run_once(job_catch_up, 20, name="catch_up")
     jq.run_repeating(job_heartbeat, interval=60, first=1, name="heartbeat")
+    jq.run_repeating(job_self_check, interval=1800, first=120, name="self_check")
 
 
 def build_application(
     cfg: Config, coach: Coach | None = None, request=None, updates_request=None, concurrent: bool = True
 ) -> Application:
-    builder = ApplicationBuilder().token(cfg.telegram_token).defaults(Defaults(tzinfo=cfg.tz)).post_init(post_init)
+    builder = (
+        ApplicationBuilder().token(cfg.telegram_token).defaults(Defaults(tzinfo=cfg.tz))
+        .post_init(post_init).post_shutdown(post_shutdown)
+    )
     if cfg.telegram_base_url:
         base = cfg.telegram_base_url.rstrip("/")
         builder = builder.base_url(f"{base}/bot").base_file_url(f"{base}/file/bot")
     if request is not None:
         builder = builder.request(request).get_updates_request(updates_request or request)
     application = builder.build()
-    application.bot_data["coach"] = coach or Coach(cfg)
+    application.bot_data["coach"] = coach = coach or Coach(cfg)
+    application.bot_data["repair"] = SelfRepair(application, coach)
     add_handlers(application, concurrent)
     schedule_jobs(application)
     return application
@@ -4033,13 +4503,19 @@ def main() -> None:
     setup_logging(cfg)
     try:
         application = build_application(cfg)
+        start_watchdog(application.bot_data["coach"].store)
         application.run_polling(
             allowed_updates=[Update.MESSAGE, Update.CALLBACK_QUERY],
             bootstrap_retries=-1,  # keep retrying if Telegram is unreachable at start up
         )
     except Exception:  # noqa: BLE001 - log through the redacting formatter, then let Docker restart us
         log.exception("The bot stopped because of an error. Docker will restart it.")
+        with contextlib.suppress(Exception):
+            note_exit(Store(cfg.data_dir), "an error stopped it")
         raise SystemExit(1) from None
+    if RESTART_REQUESTED:
+        log.warning("Restarting for self repair. Docker starts the bot again.")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

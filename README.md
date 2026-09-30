@@ -180,6 +180,27 @@ If the bot was off at a reminder time, it catches up when it starts. It sends a 
 - **Docker.** The container runs as a normal user (`PUID`/`PGID`), with `init` to reap processes and a health check the NAS Docker app shows. To pin Claude Code to one version, build with `sudo CLAUDE_CODE_VERSION=2.1.285 docker compose up -d --build`.
 - **Log safety.** Tokens are never logged. The `httpx` logger is set to WARNING because it prints the bot token in request URLs, and every log line is filtered for secrets.
 
+## Self repair
+
+The bot is built to keep running on the NAS without you watching it.
+
+- **Crashes.** If the bot process dies (an error, a memory limit, a NAS restart), Docker starts it again within seconds (`restart: unless-stopped`). The bot then messages you "♻️ I restarted after an unexpected stop" with the reason when it knows it, and catches up on anything it missed.
+- **Freezes.** Docker does not restart a container that is only marked unhealthy. So a watchdog inside the bot restarts it if its heartbeat stops for 10 minutes.
+- **Damaged files.** Every file in `./data` is written in a way that survives a power cut, and each JSON file keeps its last good copy as `.bak`. A damaged file is moved to `data/broken/` and its good copy is restored. You get a message saying which file.
+- **Self check every 30 minutes.** Low disk space, `./data` not writable, damaged files, and leftover temporary files. It fixes what it can and tells you about the rest once a day.
+- **Unexpected errors.** The bot sends the error, the lines of code around it and its recent warnings to `claude -p`. This call has no tools, so Claude can't run anything or change any file. Claude explains what went wrong and picks one fix from a fixed list:
+  - run the failed reminder again in 2 minutes;
+  - restore a damaged data file from its backup;
+  - clear the chat memory;
+  - empty the work folder;
+  - rebuild this week's plan (at most once a week);
+  - restart (at most 3 times in 6 hours);
+  - or change nothing.
+
+  The bot carries out that fix and sends you a 🩺 message: what went wrong, what it did and, for a bug, the code change Claude suggests. Claude never edits the bot's code. A change inside the container would be lost at the next update, so bring the suggestion to your next update instead.
+- **Limits.** Each problem is looked at once every 12 hours, and at most 6 a day, so a repeating error doesn't run up usage. Every error is saved in `data/errors.jsonl`. `/status` shows the last problem, what was done, and how often the bot started this week.
+- `SELF_REPAIR=off` in `bot.env` skips the Claude diagnosis. You are still told about errors, and everything else above keeps working.
+
 ## Everyday maintenance
 
 - **Renew the Claude token** once a year (the bot reminds you):

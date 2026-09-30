@@ -167,6 +167,9 @@ def make_day(text):
 
 
 def make_structured(text):
+    if text.startswith("SELF REPAIR"):
+        return {"diagnosis": "A fake diagnosis.", "remedy": "none", "file": "", "message": "Nothing to do.",
+                "code_fix": ""}
     if "Return only this one day" in text:
         return make_day(text)
     fixing = _after("The plan:", text) if "Your plan below has problems" in text else None
@@ -262,7 +265,8 @@ else:
     )
 payload = {"type": "result", "subtype": "success", "is_error": False, "result": result,
            "num_turns": 1, "total_cost_usd": 0.01, "session_id": "fake"}
-structured = entry.get("structured", os.environ.get("FAKE_CLAUDE_STRUCTURED") == "1" and "result" not in entry)
+structured = entry.get("structured", (os.environ.get("FAKE_CLAUDE_STRUCTURED") == "1" or stdin.startswith("SELF REPAIR"))
+                       and "result" not in entry)
 if flag("--json-schema") and structured:
     payload.update(result="", num_turns=2,
                    structured_output=structured if isinstance(structured, dict) else make_structured(stdin))
