@@ -7,11 +7,64 @@ Tests queue incoming updates and read back every call the bot made.
 
 from __future__ import annotations
 
+import html
 import json
+import re
 import threading
 import time
+from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
+
+# Tags Telegram accepts in HTML parse mode, and the entities it understands.
+TELEGRAM_TAGS = {"b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "a", "code", "pre",
+                 "tg-spoiler", "span", "blockquote", "tg-emoji"}
+BAD_ENTITY_RE = re.compile(r"&(?!(?:lt|gt|amp|quot|#\d+|#x[0-9a-fA-F]+);)")
+
+
+class _TelegramHTML(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.stack, self.text, self.error = [], [], None
+
+    def handle_starttag(self, tag, attrs):
+        if tag not in TELEGRAM_TAGS:
+            self.error = self.error or f"unsupported start tag \"{tag}\""
+        self.stack.append(tag)
+
+    def handle_endtag(self, tag):
+        if not self.stack or self.stack[-1] != tag:
+            self.error = self.error or f"can't find end tag corresponding to start tag \"{tag}\""
+        else:
+            self.stack.pop()
+
+    def handle_data(self, data):
+        self.text.append(data)
+
+
+def check_message(params: dict) -> str | None:
+    """What Telegram would say about this message, or None when it would accept it."""
+    text = str(params.get("text", ""))
+    visible = text
+    if params.get("parse_mode") == "HTML":
+        if BAD_ENTITY_RE.search(text):
+            return "Bad Request: can't parse entities: unsupported entity"
+        parser = _TelegramHTML()
+        parser.feed(text)
+        parser.close()
+        if parser.error or parser.stack:
+            return f"Bad Request: can't parse entities: {parser.error or 'unclosed tag'}"
+        visible = "".join(parser.text)
+    if not visible.strip():
+        return "Bad Request: message text is empty"
+    if len(visible.encode("utf-16-le")) // 2 > 4096:
+        return "Bad Request: message is too long"
+    markup = params.get("reply_markup") or {}
+    for row in markup.get("inline_keyboard", []) if isinstance(markup, dict) else []:
+        for button in row:
+            if len(str(button.get("callback_data", "")).encode()) > 64:
+                return "Bad Request: BUTTON_DATA_INVALID"
+    return None
 
 BOT_USER = {
     "id": 4242,
@@ -38,6 +91,7 @@ class FakeBotAPI:
     def __init__(self, token: str):
         self.token = token
         self.calls: list[tuple[str, dict]] = []
+        self.errors: list[tuple[str, str]] = []  # messages Telegram would have rejected
         self._updates: list[dict] = []
         self._next_update = 1
         self._next_message = 500
@@ -96,6 +150,10 @@ class FakeBotAPI:
         if method == "getUpdates":
             return 200, {"ok": True, "result": self._get_updates(params)}
         if method in ("sendMessage", "editMessageText"):
+            problem = check_message(params)
+            if problem:
+                self.errors.append((problem, str(params.get("text", ""))[:200]))
+                return 400, {"ok": False, "error_code": 400, "description": problem}
             with self._cond:
                 self._next_message += 1
                 message_id = int(params.get("message_id") or self._next_message)

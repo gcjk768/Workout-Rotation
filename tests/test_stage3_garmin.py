@@ -156,7 +156,7 @@ async def test_session_reminder_warns_on_poor_recovery(app, claude, clock, garmi
     text = app.tg.texts()[-1]
     assert text.startswith("🏋️ Today's session")
     assert "⚠️ Your Garmin data says recovery looks low today: short sleep (5.2 h)" in text
-    assert "ask me for a lighter version" in text
+    assert "tap Lighter version below" in text
 
 
 async def test_session_reminder_has_no_warning_when_recovered(app, claude, clock, garmin_db):

@@ -58,4 +58,5 @@ def test_real_bot_process(tmp_path):
     assert "Coach bot ready" in output
     assert e2e_scenario.TOKEN not in output and "E2EFAKE" not in output
     assert "Traceback" not in output, output[-2000:]
+    assert " ERROR " not in output and "Telegram rejected the HTML" not in output, output[-2000:]
     assert (tmp_path / "data" / "plans").is_dir() and list((tmp_path / "work").iterdir()) == []
