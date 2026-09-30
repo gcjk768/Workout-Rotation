@@ -27,6 +27,8 @@ from zoneinfo import ZoneInfo
 
 from telegram import (
     BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     LinkPreviewOptions,
     Update,
 )
@@ -36,6 +38,7 @@ from telegram.ext import (
     Application,
     ApplicationBuilder,
     ApplicationHandlerStop,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     Defaults,
@@ -405,6 +408,53 @@ class Store:
     def set_injury(self, text: str, when: datetime) -> None:
         self.write_json("injury.json", {"text": text, "updated": when.isoformat(timespec="minutes")})
 
+    # -- workout logs, shoulder ratings, sessions, check ins ------------------
+
+    def add_log(self, when: datetime, text: str) -> None:
+        self._append_jsonl(
+            "logs.jsonl",
+            {"date": when.date().isoformat(), "time": when.strftime("%H:%M"), "text": text},
+        )
+
+    def logs(self, since: date | None = None) -> list[dict]:
+        rows = self._read_jsonl("logs.jsonl")
+        return [r for r in rows if since is None or str(r.get("date", "")) >= since.isoformat()]
+
+    def add_rating(self, day: date, when: datetime, rating: int, note: str) -> None:
+        self._append_jsonl(
+            "shoulder.jsonl",
+            {"date": day.isoformat(), "time": when.strftime("%H:%M"), "rating": rating, "note": note},
+        )
+
+    def ratings(self, since: date | None = None) -> list[dict]:
+        rows = [r for r in self._read_jsonl("shoulder.jsonl") if isinstance(r.get("rating"), int)]
+        rows.sort(key=lambda r: (str(r.get("date", "")), str(r.get("time", ""))))
+        return [r for r in rows if since is None or str(r.get("date", "")) >= since.isoformat()]
+
+    def sessions(self) -> dict:
+        return self.read_json("sessions.json", {})
+
+    def set_session(self, day: date, status: str, when: datetime, source: str) -> None:
+        data = self.sessions()
+        data[day.isoformat()] = {
+            "status": status,
+            "at": when.isoformat(timespec="minutes"),
+            "source": source,
+        }
+        self.write_json("sessions.json", data)
+
+    def checkin_path(self, sunday: date) -> Path:
+        return self.root / "checkins" / f"{sunday.isoformat()}.txt"
+
+    def load_checkin(self, sunday: date) -> str | None:
+        path = self.checkin_path(sunday)
+        return path.read_text(encoding="utf-8").strip() if path.exists() else None
+
+    def save_checkin(self, sunday: date, text: str) -> None:
+        existing = self.load_checkin(sunday)
+        combined = f"{existing}\n\n{text.strip()}" if existing else text.strip()
+        self._write(self.checkin_path(sunday), combined + "\n")
+
     # -- chat memory --------------------------------------------------------
 
     def memory(self, chat_id: int) -> list[dict]:
@@ -593,6 +643,49 @@ def fmt_day(d: date) -> str:
 
 def fmt_long(d: date) -> str:
     return f"{d:%A} {d.day} {d:%B %Y}"
+
+
+def _row_date(row: dict) -> date | None:
+    with contextlib.suppress(ValueError, TypeError):
+        return date.fromisoformat(str(row.get("date")))
+    return None
+
+
+def shoulder_trend(ratings: list[dict], today: date) -> str:
+    """One or two sentences about where the left shoulder is heading (higher = more pain)."""
+    if not ratings:
+        return "No shoulder ratings yet. Rate it after a session with /done, or send /shoulder 3."
+    latest = ratings[-1]
+    latest_day = _row_date(latest)
+    parts = [f"Latest {latest['rating']}/10" + (f" on {fmt_day(latest_day)}." if latest_day else ".")]
+    recent = [r["rating"] for r in ratings if (d := _row_date(r)) and d > today - timedelta(days=14)]
+    before = [
+        r["rating"]
+        for r in ratings
+        if (d := _row_date(r)) and today - timedelta(days=28) < d <= today - timedelta(days=14)
+    ]
+    if recent:
+        avg = sum(recent) / len(recent)
+        sentence = f"Last 2 weeks average {avg:.1f} from {len(recent)} rating{'s' if len(recent) > 1 else ''}"
+        if before:
+            prev = sum(before) / len(before)
+            if avg - prev >= 0.5:
+                sentence += f", up from {prev:.1f}, so the pain is rising."
+            elif prev - avg >= 0.5:
+                sentence += f", down from {prev:.1f}, so it is improving."
+            else:
+                sentence += f", about the same as the 2 weeks before ({prev:.1f})."
+        else:
+            sentence += "."
+        parts.append(sentence)
+    last3 = [r["rating"] for r in ratings[-3:]]
+    if len(last3) == 3 and last3[0] < last3[1] < last3[2]:
+        parts.append("The last three ratings went up each time.")
+    return " ".join(parts)
+
+
+def shoulder_rising(ratings: list[dict], today: date) -> bool:
+    return "rising" in shoulder_trend(ratings, today) or "went up" in shoulder_trend(ratings, today)
 
 
 # ---------------------------------------------------------------------------
@@ -1115,9 +1208,65 @@ class Coach:
     def injury_text(self) -> tuple[str, str | None]:
         return self.store.injury(self.cfg.injury_notes)
 
+    def week_sessions_text(self, monday: date) -> str | None:
+        sessions = self.store.sessions()
+        done = []
+        for i in range(7):
+            entry = sessions.get((monday + timedelta(days=i)).isoformat())
+            if entry:
+                done.append(f"{DAY_NAMES[i]} {entry['status']}")
+        return ", ".join(done) if done else None
+
+    def trend(self) -> str:
+        return shoulder_trend(self.store.ratings(), self.today())
+
     def extra_context(self, now: datetime) -> list[str]:
-        """Sections added by later stages (logs, ratings, Garmin)."""
-        return []
+        today = now.date()
+        since = today - timedelta(days=13)
+        parts = []
+        week = self.week_sessions_text(monday_of(today))
+        parts.append(
+            f"Sessions this week so far: {week}." if week else "Sessions this week so far: none marked done or skipped yet."
+        )
+        logs = self.store.logs(since)
+        if logs:
+            lines = [f"{fmt_day(d)} {r.get('time', '')}: {r['text']}" for r in logs if (d := _row_date(r))]
+            parts.append("My workout logs from the last 14 days:\n" + "\n".join(lines))
+        else:
+            parts.append("My workout logs from the last 14 days: none.")
+        ratings = self.store.ratings(since)
+        if ratings:
+            lines = [
+                f"{fmt_day(d)} {r.get('time', '')}: {r['rating']}/10" + (f" ({r['note']})" if r.get("note") else "")
+                for r in ratings
+                if (d := _row_date(r))
+            ]
+            parts.append(
+                "My left shoulder ratings from the last 14 days (0 = no pain, 10 = worst pain):\n"
+                + "\n".join(lines)
+            )
+        else:
+            parts.append("My left shoulder ratings from the last 14 days: none.")
+        parts.append("Shoulder trend: " + self.trend())
+        last_sunday = today - timedelta(days=(today.weekday() + 1) % 7)
+        checkin = self.store.load_checkin(last_sunday)
+        if checkin:
+            parts.append(f"My Sunday check in answer from {fmt_day(last_sunday)}:\n{checkin}")
+        garmin = self.garmin_context(today)
+        if garmin:
+            parts.append(garmin)
+        return parts
+
+    def garmin_context(self, today: date) -> str | None:
+        """Stage 3 adds the Garmin summary."""
+        return None
+
+    def garmin_profile_line(self, today: date) -> str | None:
+        return None
+
+    def recovery_note(self, today: date) -> str | None:
+        """Stage 3: a warning when Garmin shows poor recovery."""
+        return None
 
     def system_prompt(self) -> str:
         now = self.now()
@@ -1179,8 +1328,8 @@ class Coach:
         return list(seen.values())
 
     def checkin_for(self, monday: date) -> str | None:
-        """Stage 2 fills this in: the Sunday check in before this week."""
-        return None
+        """The Sunday check in answer given just before this week."""
+        return self.store.load_checkin(monday - timedelta(days=1))
 
     def plan_problems(self, text: str) -> list[str]:
         problems = []
@@ -1321,6 +1470,87 @@ class Coach:
             request = self.plan_request(monday, notes)
             return await self.generate_plan(monday, request, kind=kind, save_split=save_split, notes=notes)
 
+    async def adjust_after_skip(self, day: date) -> PlanResult | None:
+        """Rewrite the rest of the week after a skipped session, without doubling up."""
+        monday = monday_of(day)
+        wd = day.weekday()
+        if wd >= 6:
+            return None
+        async with self.plan_lock:
+            plan = self.store.load_plan(monday)
+            if not plan:
+                return None
+            today_plan = parse_plan(plan).days.get(wd)
+            focus = today_plan.focus if today_plan else "today's session"
+            kept = "Monday" if wd == 0 else f"Monday to {DAY_NAMES[wd]}"
+            request = "\n".join(
+                [
+                    f"I skipped today's session ({DAY_NAMES[wd]}: {focus}).",
+                    f"Adjust the rest of this week, {DAY_NAMES[wd + 1]} to Sunday, following your "
+                    "rules: do not double up, keep what matters most, and keep my shoulder safe.",
+                    f"Keep {kept} exactly as written, but add (skipped) at the end of the "
+                    f"{DAY_NAMES[wd]} line.",
+                    "Keep this week's main equipment and effort. Return the full week.",
+                    "",
+                    PLAN_FORMAT_RULES.format(preface_rule=""),
+                    "",
+                    "This week's plan:",
+                    plan,
+                ]
+            )
+            return await self.generate_plan(monday, request, kind="adjusted", save_split=False)
+
+    def capture_checkin(self, message) -> str | None:
+        """Save a reply to the Sunday check in, or the next message before the plan time."""
+        st = self.store.state().get("checkin")
+        if not st:
+            return None
+        now = self.now()
+        replied = bool(message.reply_to_message) and message.reply_to_message.message_id == st.get("message_id")
+        until = datetime.fromisoformat(st["until"])
+        asked = datetime.fromisoformat(st["asked_at"])
+        waiting = not st.get("answered") and asked <= now < until
+        if not (replied or waiting):
+            return None
+        sunday = date.fromisoformat(st["sunday"])
+        self.store.save_checkin(sunday, message.text or "")
+        st.update(answered=True, answered_at=now.isoformat(timespec="seconds"))
+        self.store.update_state(checkin=st)
+        if now < until:
+            return f"Thanks, I saved your check in. Next week's plan gets built at {self.cfg.plan_time:%H:%M}."
+        return (
+            "Thanks, I saved your check in. Next week's plan is already built, so send /nextweek "
+            "tonight (or /plan from Monday) if you want it rebuilt with this answer."
+        )
+
+    def token_reminder(self) -> str | None:
+        """A reminder text when the one year Claude token is within a month of expiring."""
+        created = self.cfg.token_created
+        if not created:
+            return None
+        try:
+            expires = created.replace(year=created.year + 1)
+        except ValueError:  # 29 February
+            expires = created + timedelta(days=365)
+        today = self.today()
+        left = (expires - today).days
+        if left > 30:
+            return None
+        last = self.store.state().get("token_reminder") or {}
+        if last.get("created") == created.isoformat():
+            gap = 1 if left <= 7 else 7
+            if (today - date.fromisoformat(last["sent"])).days < gap:
+                return None
+        self.store.update_state(token_reminder={"created": created.isoformat(), "sent": today.isoformat()})
+        steps = (
+            "On your computer run claude setup-token, put the new token in bot.env as "
+            "CLAUDE_CODE_OAUTH_TOKEN, set CLAUDE_TOKEN_CREATED to today's date, then run "
+            "docker compose up -d in the bot folder."
+        )
+        if left < 0:
+            return f"🔑 Your Claude Code token probably expired on {fmt_day(expires)}. {steps}"
+        return f"🔑 Your Claude Code token expires in {left} days, on {fmt_day(expires)}. {steps}"
+
     # -- plain views ----------------------------------------------------------
 
     def today_text(self) -> str:
@@ -1335,6 +1565,11 @@ class Coach:
                 f"I could not find {DAY_NAMES[today.weekday()]} in this week's plan, so here is "
                 f"the whole week.\n\n{plan}"
             )
+        status = self.store.sessions().get(today.isoformat(), {}).get("status")
+        if status == "done":
+            return "✅ Already marked done today.\n\n" + day.text
+        if status == "skipped":
+            return "⏭ Marked as skipped today.\n\n" + day.text
         return day.text
 
     def week_text(self) -> str:
@@ -1355,10 +1590,17 @@ class Coach:
             return "No plan is saved for this week yet. Send /plan to build one." + note
         return f"**{self.week_label(monday)}**\n\n{plan.strip()}{note}"
 
-    def overview(self, result: PlanResult, heading: str) -> str:
+    def rest_of_week(self, result: PlanResult, skipped: date) -> str:
+        text = self.overview(result, "Here is the rest of your week, adjusted:", start=skipped.weekday() + 1)
+        text += "\n\nSend /week for the full plan."
+        if result.warnings:
+            text += "\n\n⚠️ Please check:\n" + "\n".join(f"• {w}" for w in result.warnings)
+        return text
+
+    def overview(self, result: PlanResult, heading: str, start: int = 0) -> str:
         parsed = parse_plan(result.text)
         lines = [heading, ""]
-        for idx in range(7):
+        for idx in range(start, 7):
             day = parsed.days.get(idx)
             if not day:
                 continue
@@ -1477,10 +1719,155 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """A plain message in a private chat works like /ask."""
+    """A plain message in a private chat works like /ask, unless it answers the check in."""
     text = (update.effective_message.text or "").strip()
-    if text:
-        await answer_question(update, context, text)
+    if not text:
+        return
+    saved = coach_of(context).capture_checkin(update.effective_message)
+    if saved:
+        await reply(update, context, saved)
+        return
+    await answer_question(update, context, text)
+
+
+def rating_keyboard(day: date) -> InlineKeyboardMarkup:
+    rows = [range(0, 6), range(6, 11)]
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(str(n), callback_data=f"rate:{day.isoformat()}:{n}") for n in row] for row in rows]
+    )
+
+
+RATING_QUESTION = "How does your left shoulder feel right now, from 0 (no pain) to 10 (worst pain)?"
+
+
+async def cmd_log(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    coach = coach_of(context)
+    text = args_text(update)
+    if not text:
+        logs = coach.store.logs(coach.today() - timedelta(days=13))
+        if not logs:
+            await reply(update, context, "No logs in the last 2 weeks. Log a session like this:\n/log rows 22kg 3x10, floor press 14kg 3x8 felt easy")
+            return
+        lines = [f"• {fmt_day(d)}: {r['text']}" for r in logs if (d := _row_date(r))]
+        await reply(update, context, "**Your logs from the last 2 weeks**\n\n" + "\n".join(lines))
+        return
+    now = coach.now()
+    coach.store.add_log(now, text)
+    await reply(update, context, f"Logged for {fmt_day(now.date())}. Send /done when you finish the session.")
+
+
+async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    coach = coach_of(context)
+    now = coach.now()
+    extra = args_text(update)
+    if extra:
+        coach.store.add_log(now, extra)
+    coach.store.set_session(now.date(), "done", now, "command")
+    await reply(
+        update,
+        context,
+        f"✅ Nice work. Today's session is marked done.\n\n{RATING_QUESTION}",
+        reply_markup=rating_keyboard(now.date()),
+    )
+
+
+def shoulder_log_text(coach: Coach) -> str:
+    ratings = coach.store.ratings()
+    if not ratings:
+        return "No shoulder ratings yet. You get the buttons after /done, or send /shoulder 3 to add one."
+    lines = ["**Left shoulder ratings** (0 = no pain, 10 = worst pain)", ""]
+    for r in ratings:
+        d = _row_date(r)
+        when = f"{d:%a} {d.day} {d:%b %Y}" if d else str(r.get("date"))
+        note = f" ({r['note']})" if r.get("note") else ""
+        lines.append(f"{when}, {r.get('time', '')}: {r['rating']}/10{note}")
+    lines += ["", "Trend: " + coach.trend()]
+    return "\n".join(lines)
+
+
+def rating_feedback(coach: Coach, rating: int) -> str:
+    text = "Trend: " + coach.trend()
+    if rating >= 6 or shoulder_rising(coach.store.ratings(), coach.today()):
+        text += (
+            "\n\nThat is on the high side. Keep the left arm light and pain free, and check with "
+            "your physio."
+        )
+    if rating >= 7:
+        text += (
+            " If the pain is sharp or getting worse, wakes you at night, or comes with numbness, "
+            "tingling or sudden weakness, stop training it and see a doctor or physio."
+        )
+    return text
+
+
+async def cmd_shoulder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    coach = coach_of(context)
+    arg = args_text(update)
+    if arg:
+        m = re.fullmatch(r"(\d{1,2})(?:\s*/\s*10)?\s*(.*)", arg, re.DOTALL)
+        if not m or int(m.group(1)) > 10:
+            await reply(update, context, "Send /shoulder on its own for your log, or /shoulder 3 to save a rating from 0 to 10.")
+            return
+        now = coach.now()
+        rating = int(m.group(1))
+        coach.store.add_rating(now.date(), now, rating, m.group(2).strip() or "manual")
+        await reply(update, context, f"Left shoulder {rating}/10 saved.\n\n" + rating_feedback(coach, rating))
+        return
+    await reply(update, context, shoulder_log_text(coach))
+
+
+async def on_rate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    coach = coach_of(context)
+    try:
+        _, day_raw, value = query.data.split(":")
+        day, rating = date.fromisoformat(day_raw), int(value)
+    except ValueError:
+        await query.answer()
+        return
+    coach.store.add_rating(day, coach.now(), rating, "after session")
+    await query.answer(f"Saved {rating}/10")
+    with contextlib.suppress(BadRequest):
+        await query.edit_message_text(f"Left shoulder {rating}/10 saved for {fmt_day(day)}.")
+    await send_text(context.bot, query.message.chat.id, rating_feedback(coach, rating))
+
+
+async def on_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Done or Skipped from the evening check."""
+    query = update.callback_query
+    coach = coach_of(context)
+    try:
+        _, day_raw, answer = query.data.split(":")
+        day = date.fromisoformat(day_raw)
+    except ValueError:
+        await query.answer()
+        return
+    chat_id = query.message.chat.id
+    now = coach.now()
+    previous = coach.store.sessions().get(day.isoformat(), {}).get("status")
+    await query.answer()
+    if answer == "done":
+        coach.store.set_session(day, "done", now, "button")
+        with contextlib.suppress(BadRequest):
+            await query.edit_message_text(f"✅ {fmt_day(day)} marked as done. Nice work.")
+        await send_text(context.bot, chat_id, RATING_QUESTION, reply_markup=rating_keyboard(day))
+        return
+    coach.store.set_session(day, "skipped", now, "button")
+    with contextlib.suppress(BadRequest):
+        await query.edit_message_text(f"⏭ {fmt_day(day)} marked as skipped.")
+    if previous == "skipped" or monday_of(day) != monday_of(coach.today()) or day.weekday() >= 6:
+        return
+    if not coach.store.load_plan(monday_of(day)):
+        return
+    await send_text(context.bot, chat_id, "No problem. I am adjusting the rest of your week so you do not double up. This takes a minute or two.")
+    try:
+        async with typing(context.bot, chat_id):
+            result = await coach.adjust_after_skip(day)
+    except ClaudeError as exc:
+        await send_text(context.bot, chat_id, f"I saved the skip but could not adjust the plan. {exc.user_message}")
+        return
+    if result:
+        await send_text(context.bot, chat_id, coach.rest_of_week(result, day))
 
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1576,8 +1963,22 @@ def profile_text(coach: Coach) -> str:
 
 
 def coach_profile_extra(coach: Coach) -> list[str]:
-    """Later stages add the shoulder trend and Garmin summary here."""
-    return []
+    today = coach.today()
+    logs = coach.store.logs(today - timedelta(days=13))
+    week = coach.week_sessions_text(monday_of(today))
+    lines = [
+        "",
+        "**Left shoulder**",
+        coach.trend(),
+        "",
+        "**Training**",
+        f"• This week: {week or 'nothing marked done or skipped yet'}",
+        f"• Workout logs in the last 2 weeks: {len(logs)}",
+    ]
+    garmin = coach.garmin_profile_line(today)
+    if garmin:
+        lines += ["", "**Garmin**", garmin]
+    return lines
 
 
 async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1614,7 +2015,7 @@ async def status_text(coach: Coach, application: Application) -> str:
     jobs = application.job_queue.jobs() if application.job_queue else ()
     lines += ["", "**Next reminders**"]
     upcoming = sorted(
-        ((job.next_t, JOB_LABELS.get(job.name, job.name)) for job in jobs if job.next_t),
+        ((when, JOB_LABELS.get(job.name, job.name)) for job in jobs if (when := job_next(job))),
         key=lambda item: item[0],
     )
     if upcoming:
@@ -1630,7 +2031,6 @@ async def status_text(coach: Coach, application: Application) -> str:
     return "\n".join(lines)
 
 
-JOB_LABELS: dict[str, str] = {}
 
 
 def status_extra(coach: Coach) -> list[str]:
@@ -1683,6 +2083,11 @@ def add_handlers(application: Application, concurrent: bool = True) -> None:
     application.add_handler(CommandHandler("week", cmd_week))
     application.add_handler(CommandHandler("plan", cmd_plan, **slow))
     application.add_handler(CommandHandler("nextweek", cmd_nextweek, **slow))
+    application.add_handler(CommandHandler("log", cmd_log))
+    application.add_handler(CommandHandler("done", cmd_done))
+    application.add_handler(CommandHandler("shoulder", cmd_shoulder))
+    application.add_handler(CallbackQueryHandler(on_rate, pattern=r"^rate:"))
+    application.add_handler(CallbackQueryHandler(on_check, pattern=r"^chk:", **slow))
     application.add_handler(CommandHandler("injury", cmd_injury))
     application.add_handler(CommandHandler("profile", cmd_profile))
     application.add_handler(CommandHandler("status", cmd_status, **slow))
@@ -1694,8 +2099,214 @@ def add_handlers(application: Application, concurrent: bool = True) -> None:
     application.add_error_handler(on_error)
 
 
+# ---------------------------------------------------------------------------
+# Reminders
+# ---------------------------------------------------------------------------
+
+JOB_LABELS = {
+    "session_reminder": "Session reminder",
+    "session_reminder_fri": "Session reminder",
+    "evening_check": "Did you train? check",
+    "checkin": "Sunday check in",
+    "weekly_plan": "Next week's plan",
+    "token_check": "Token expiry check",
+    "catch_up": "Start up catch up",
+}
+
+CHECKIN_TEXT = """🗓 Weekly check in
+
+How did this week go? Tell me about:
+• your energy
+• any soreness
+• your left shoulder, from 0 (no pain) to 10 (worst pain)
+
+Reply to this message, or just send your next message before {until}. I will use it for next week's plan."""
+
+
+def job_next(job) -> datetime | None:
+    try:
+        return job.next_t
+    except AttributeError:  # not scheduled yet
+        return None
+
+
+def ptb_days(days: list[int]) -> tuple[int, ...]:
+    """python-telegram-bot counts days from Sunday = 0; the rest of the bot from Monday = 0."""
+    return tuple(sorted((d + 1) % 7 for d in days))
+
+
+async def owner_send(context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None) -> list:
+    coach = coach_of(context)
+    if coach.cfg.owner_id is None:
+        log.warning("No ALLOWED_USER_IDS, so reminders have nowhere to go")
+        return []
+    return await send_text(context.bot, coach.cfg.owner_id, text, reply_markup=reply_markup)
+
+
+async def job_session_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Today's session before the gym."""
+    coach = coach_of(context)
+    today = coach.today()
+    monday = monday_of(today)
+    if coach.store.sessions().get(today.isoformat(), {}).get("status") == "done":
+        return
+    if not coach.store.load_plan(monday):
+        if not coach.program_start():
+            await owner_send(context, "No training plan yet. Send /plan to build your first week.")
+            return
+        try:
+            await coach.build_week(monday, kind="build", wait=True)
+        except ClaudeError as exc:
+            await owner_send(context, f"This week has no plan and I could not build one. {exc.user_message} Send /plan to try again.")
+            return
+    day = parse_plan(coach.store.load_plan(monday) or "").days.get(today.weekday())
+    if day is None:
+        text = coach.today_text()
+    elif day.is_rest:
+        text = f"Rest day today.\n\n{day.text}"
+    else:
+        text = f"🏋️ Today's session\n\n{day.text}"
+    note = coach.recovery_note(today)
+    if note:
+        text += "\n\n" + note
+    await owner_send(context, text)
+
+
+def check_keyboard(day: date) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Done", callback_data=f"chk:{day.isoformat()}:done"),
+                InlineKeyboardButton("⏭ Skipped", callback_data=f"chk:{day.isoformat()}:skip"),
+            ]
+        ]
+    )
+
+
+async def job_evening_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ask whether I trained, if /done was not sent on a training day."""
+    coach = coach_of(context)
+    today = coach.today()
+    if coach.store.sessions().get(today.isoformat()):
+        return
+    plan = coach.store.load_plan(monday_of(today))
+    if not plan and not coach.program_start():
+        return
+    day = parse_plan(plan or "").days.get(today.weekday())
+    if day and day.is_rest:
+        return
+    focus = f" ({day.focus})" if day else ""
+    await owner_send(context, f"Did you train today{focus}?", reply_markup=check_keyboard(today))
+
+
+async def job_checkin(context: ContextTypes.DEFAULT_TYPE) -> None:
+    coach = coach_of(context)
+    now = coach.now()
+    until = datetime.combine(now.date(), coach.cfg.plan_time, tzinfo=coach.cfg.tz)
+    sent = await owner_send(context, CHECKIN_TEXT.format(until=f"{coach.cfg.plan_time:%H:%M}"))
+    if sent:
+        coach.store.update_state(
+            checkin={
+                "sunday": now.date().isoformat(),
+                "message_id": sent[-1].message_id,
+                "asked_at": now.isoformat(timespec="seconds"),
+                "until": until.isoformat(timespec="seconds"),
+                "answered": False,
+            }
+        )
+
+
+async def build_next_week(context: ContextTypes.DEFAULT_TYPE, monday: date) -> None:
+    """Build next week's plan with the check in answer and send an overview."""
+    coach = coach_of(context)
+    sunday = monday - timedelta(days=1)
+    st = coach.store.state().get("checkin") or {}
+    answered_at = st.get("answered_at") if st.get("sunday") == sunday.isoformat() else None
+    existing = coach.store.load_plan(monday)
+    meta = coach.store.load_plan_meta(monday)
+    if existing and (answered_at is None or meta.get("built_at", "") >= answered_at):
+        result = PlanResult(monday, existing, meta, meta.get("warnings", []))
+        heading = "🗓 Next week's plan was already built"
+    else:
+        try:
+            result = await coach.build_week(monday, kind="scheduled", wait=True)
+        except ClaudeError as exc:
+            await owner_send(context, f"I could not build next week's plan. {exc.user_message} Send /nextweek to try again.")
+            return
+        heading = "🗓 Next week is ready"
+    text = coach.overview(result, f"{heading}. {coach.week_label(monday)}")
+    text += "\n\nLeft shoulder: " + coach.trend()
+    if not coach.store.load_checkin(sunday):
+        text += "\n\nI did not get a check in answer this week, so I built it without one."
+    if result.warnings:
+        text += "\n\n⚠️ Please check:\n" + "\n".join(f"• {w}" for w in result.warnings)
+    text += "\n\nSend /week to see the full plan."
+    await owner_send(context, text)
+
+
+async def job_weekly_plan(context: ContextTypes.DEFAULT_TYPE) -> None:
+    coach = coach_of(context)
+    await build_next_week(context, monday_of(coach.today()) + timedelta(days=7))
+
+
+async def job_token_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = coach_of(context).token_reminder()
+    if text:
+        await owner_send(context, text)
+
+
+async def job_catch_up(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """After a restart, do what was missed: the check in, next week's plan or this week's plan."""
+    coach = coach_of(context)
+    cfg = coach.cfg
+    if not coach.store.plan_mondays():
+        return  # the programme starts with the first /plan
+    now = coach.now()
+    today = now.date()
+    monday = monday_of(today)
+    if today.weekday() == 6:
+        st = coach.store.state().get("checkin") or {}
+        if cfg.checkin_time <= now.time() < cfg.plan_time and st.get("sunday") != today.isoformat():
+            await job_checkin(context)
+            return
+        if now.time() >= cfg.plan_time and not coach.store.load_plan(monday + timedelta(days=7)):
+            await owner_send(context, "I was offline at plan time, so I am building next week's plan now.")
+            await build_next_week(context, monday + timedelta(days=7))
+            return
+    if today.weekday() <= 4 and not coach.store.load_plan(monday):
+        await owner_send(context, "I was offline when this week's plan was due, so I am building it now.")
+        try:
+            result = await coach.build_week(monday, kind="build", wait=True)
+        except ClaudeError as exc:
+            await owner_send(context, f"I could not build this week's plan. {exc.user_message} Send /plan to try again.")
+            return
+        await owner_send(
+            context,
+            coach.overview(result, f"🗓 This week's plan. {coach.week_label(monday)}")
+            + "\n\nSend /today or /week for the details.",
+        )
+
+
 def schedule_jobs(application: Application) -> None:
-    """Stage 2 adds the reminders."""
+    coach: Coach = application.bot_data["coach"]
+    cfg = coach.cfg
+    jq = application.job_queue
+    if jq is None:
+        log.error("The job queue is missing. Install python-telegram-bot[job-queue].")
+        return
+    daily = {"job_kwargs": {"misfire_grace_time": 600, "coalesce": True}}
+
+    def at(t: dtime) -> dtime:
+        return t.replace(tzinfo=cfg.tz)
+
+    jq.run_daily(job_session_reminder, at(cfg.reminder_mon_thu), days=ptb_days([0, 1, 2, 3]), name="session_reminder", **daily)
+    jq.run_daily(job_session_reminder, at(cfg.reminder_fri), days=ptb_days([4]), name="session_reminder_fri", **daily)
+    if cfg.training_days:
+        jq.run_daily(job_evening_check, at(cfg.check_time), days=ptb_days(cfg.training_days), name="evening_check", **daily)
+    jq.run_daily(job_checkin, at(cfg.checkin_time), days=ptb_days([6]), name="checkin", **daily)
+    jq.run_daily(job_weekly_plan, at(cfg.plan_time), days=ptb_days([6]), name="weekly_plan", **daily)
+    jq.run_daily(job_token_check, at(cfg.token_check_time), name="token_check", **daily)
+    jq.run_once(job_catch_up, 20, name="catch_up")
 
 
 def build_application(
