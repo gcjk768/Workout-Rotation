@@ -394,12 +394,12 @@ async def test_lighter_version_is_a_card(app, claude, clock):
     messages = html_messages(app, before)
     assert_telegram_accepts(messages)
     text = "\n\n".join(m["text"] for m in messages)
-    assert text.startswith("<b>📅 Wednesday 30 Sep · Legs and core, lighter</b>\n<i>🪶 Lighter version of today's session</i>")
+    assert text.startswith("<b>📅 Wednesday 30 Sep · Legs and core</b>\n<i>🪶 Lighter version of today's session</i>")
     assert "⏱ About 45 min" in text and "<code>2 × 10</code> · <b>12.5 kg</b> · rest 1 min 30 s · RPE 5" in text
     assert "💬 Fewer sets and lighter weights." in text and "<blockquote expandable>" in text
     coach = app.bot_data["coach"]
     memory = coach.store.memory(OWNER)[-1]
-    assert memory["q"].startswith("Give me a lighter version") and "📅 Wednesday: Legs and core, lighter" in memory["a"]
+    assert memory["q"].startswith("Give me a lighter version") and "📅 Wednesday: Legs and core" in memory["a"]
     assert coach.store.load_plan_data(MONDAY)["days"][2]["focus"] == "Legs and core"  # the plan is unchanged
 
 
