@@ -1,0 +1,18 @@
+services:
+  gym-coach:
+    build: .
+    image: gym-coach-bot:local
+    container_name: gym-coach-bot
+    restart: unless-stopped
+    env_file: bot.env
+    volumes:
+      # Plans, logs, shoulder ratings, check ins and chat memory. Include it in your NAS backups.
+      - ./data:/data
+      # garmin-monitor's data folder, read only. The bot reads monitor.db from it.
+      - /volume1/docker/garmin-monitor/data:/garmin:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    mem_limit: 1g   # python plus one or two claude -p calls at a time
