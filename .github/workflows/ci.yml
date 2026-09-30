@@ -10,8 +10,8 @@ jobs:
     name: Tests (fake Claude, fake Telegram, sample Garmin data)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -22,7 +22,7 @@ jobs:
     name: Docker image (real Dockerfile and Claude Code installer)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build the image
         run: docker build -t gym-coach-bot:ci .
@@ -35,7 +35,7 @@ jobs:
           docker run --rm -v "$PWD":/src:ro gym-coach-bot:ci sh -c
           'cp -r /src /tmp/app && cd /tmp/app && pip install -q pytest pytest-asyncio && python -m pytest -q -p no:cacheprovider'
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
