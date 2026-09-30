@@ -77,6 +77,24 @@ BOT_USER = {
 }
 
 
+def _multipart(ctype: str, raw: bytes) -> dict:
+    """Fields of a multipart upload (sendDocument); files become {filename, size, text}."""
+    from email.parser import BytesParser
+    from email.policy import default
+
+    message = BytesParser(policy=default).parsebytes(f"Content-Type: {ctype}\r\n\r\n".encode() + raw)
+    params = {}
+    for part in message.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        payload = part.get_payload(decode=True) or b""
+        if part.get_filename():
+            params[name] = {"filename": part.get_filename(), "size": len(payload),
+                            "text": payload.decode("utf-8-sig", "replace")}
+        else:
+            params[name] = _value(payload.decode("utf-8", "replace"))
+    return params
+
+
 def _value(raw: str):
     """PTB sends every parameter as a form field; lists and objects are JSON encoded."""
     if raw[:1] in "[{":
@@ -109,8 +127,12 @@ class FakeBotAPI:
 
             def do_POST(self):
                 length = int(self.headers.get("Content-Length") or 0)
-                body = self.rfile.read(length).decode() if length else ""
-                if "json" in (self.headers.get("Content-Type") or ""):
+                raw = self.rfile.read(length) if length else b""
+                body = raw.decode("utf-8", "replace")
+                ctype = self.headers.get("Content-Type") or ""
+                if "multipart/form-data" in ctype:
+                    params = _multipart(ctype, raw)
+                elif "json" in ctype:
                     params = json.loads(body or "{}")
                 else:
                     params = {k: _value(v[-1]) for k, v in parse_qs(body, keep_blank_values=True).items()}
@@ -149,6 +171,12 @@ class FakeBotAPI:
             return 200, {"ok": True, "result": BOT_USER}
         if method == "getUpdates":
             return 200, {"ok": True, "result": self._get_updates(params)}
+        if method == "sendDocument":
+            doc = params.get("document") if isinstance(params.get("document"), dict) else {}
+            return 200, {"ok": True, "result": {
+                "message_id": 9000 + len(self.calls), "date": int(time.time()),
+                "chat": {"id": int(params["chat_id"]), "type": "private"}, "from": BOT_USER,
+                "document": {"file_id": "f", "file_unique_id": "u", "file_name": doc.get("filename", "file")}}}
         if method in ("sendMessage", "editMessageText"):
             problem = check_message(params)
             if problem:

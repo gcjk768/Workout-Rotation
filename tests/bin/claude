@@ -37,13 +37,16 @@ prompt_file = flag("--system-prompt-file")
 system = open(prompt_file, encoding="utf-8").read() if prompt_file else ""
 plan_mode = flag("--tools") == ""
 
+review = stdin.startswith("SAFETY REVIEW")
 entry = {}
 queue_path = os.environ.get("FAKE_CLAUDE_QUEUE")
 if queue_path and os.path.exists(queue_path):
     with open(queue_path, encoding="utf-8") as fh:
         queue = json.load(fh)
-    if queue:
-        entry = queue.pop(0)
+    # review calls only take entries marked "review", other calls skip those entries
+    pick = next((i for i, e in enumerate(queue) if bool(e.get("review")) == review), None)
+    if pick is not None:
+        entry = queue.pop(pick)
         with open(queue_path, "w", encoding="utf-8") as fh:
             json.dump(queue, fh)
 mode = entry.get("mode") or os.environ.get("FAKE_CLAUDE_MODE", "ok")
@@ -140,6 +143,8 @@ if mode == "maxturns":
 
 if "result" in entry:
     result = entry["result"]
+elif review:
+    result = "OK"
 elif plan_mode:
     result = make_plan(stdin)
 else:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import dataclasses
 import html
 import json
@@ -26,10 +27,13 @@ from typing import Any
 from urllib.parse import quote, quote_plus
 from zoneinfo import ZoneInfo
 
+import holidays as holiday_calendars
+
 from telegram import (
     BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputFile,
     LinkPreviewOptions,
     Update,
 )
@@ -115,6 +119,13 @@ def parse_time(value: str | None, default: str) -> dtime:
     return dtime(int(m.group(1)), int(m.group(2)))
 
 
+def parse_switch(value: str | None, default: bool) -> bool:
+    raw = _clean(value).lower()
+    if not raw:
+        return default
+    return raw not in ("off", "no", "false", "0")
+
+
 def parse_optional_time(env: dict, key: str, default: str) -> dtime | None:
     """A missing setting uses the default; an empty one (KEY=) turns that reminder off."""
     if key not in env:
@@ -142,6 +153,88 @@ def injury_blocked(env: dict) -> list[str]:
     if "INJURY_BLOCKED_MOVEMENTS" in env:
         return parse_list(env["INJURY_BLOCKED_MOVEMENTS"])
     return parse_list(DEFAULT_BLOCKED) + parse_list(env.get("INJURY_EXTRA_BLOCKED"))
+
+
+MONTH_NAMES = ["january", "february", "march", "april", "may", "june", "july", "august",
+               "september", "october", "november", "december"]
+
+
+def _month(word: str) -> int | None:
+    """'Oct', 'october', 'Sept' -> month number; anything else -> None."""
+    word = word.lower()
+    if word == "sept":
+        return 9
+    if len(word) < 3:
+        return None
+    return next((i for i, name in enumerate(MONTH_NAMES, start=1) if name.startswith(word)), None)
+
+
+def _dated(year: int, month: int, day: int, today: date) -> date:
+    """A day and month without a year: this year, or next year if it is well in the past."""
+    candidate = date(year, month, day)
+    return date(year + 1, month, day) if candidate < today - timedelta(days=7) else candidate
+
+
+def parse_date_prefix(text: str, today: date) -> tuple[date, str] | None:
+    """Read one date at the start of text: 2026-10-08, 8 Oct, Oct 8, 8/10, today, tomorrow, thu."""
+    s = text.lstrip()
+    try:
+        if m := re.match(r"(\d{4})-(\d{1,2})-(\d{1,2})\b", s):
+            return date(int(m[1]), int(m[2]), int(m[3])), s[m.end():]
+        if (m := re.match(r"(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})\b", s)) and _month(m[2]):
+            return _dated(today.year, _month(m[2]), int(m[1]), today), s[m.end():]
+        if (m := re.match(r"([A-Za-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?\b", s)) and _month(m[1]):
+            return _dated(today.year, _month(m[1]), int(m[2]), today), s[m.end():]
+        if m := re.match(r"(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", s):  # day/month, as in Singapore
+            if m[3]:
+                year = int(m[3]) + (2000 if len(m[3]) == 2 else 0)
+                return date(year, int(m[2]), int(m[1])), s[m.end():]
+            return _dated(today.year, int(m[2]), int(m[1]), today), s[m.end():]
+    except ValueError:
+        return None
+    if m := re.match(r"(today|tomorrow)\b", s, re.IGNORECASE):
+        return today + timedelta(days=0 if m[1].lower() == "today" else 1), s[m.end():]
+    if m := re.match(r"(mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)(?:day|nesday|rsday|urday|sday)?\b", s, re.IGNORECASE):
+        target = DAY_LOOKUP[m[1].lower()]
+        return today + timedelta(days=(target - today.weekday()) % 7), s[m.end():]
+    return None
+
+
+def parse_away(text: str, today: date) -> tuple[date, date, str]:
+    """'8 Oct to 9 Oct Bangkok trip' -> (8 Oct, 9 Oct, 'Bangkok trip'). Raises ValueError."""
+    first = parse_date_prefix(text, today)
+    if not first:
+        raise ValueError("no date")
+    start, rest = first
+    end = start
+    sep = re.match(r"\s*(?:to|until|till|through|-|–|—)\s*", rest, re.IGNORECASE)
+    second = parse_date_prefix(rest[sep.end():] if sep else rest, today)
+    if second:
+        end, rest = second
+        if end < start and (start - end).days > 7:  # "28 Dec to 2 Jan"
+            end = end.replace(year=end.year + 1)
+    elif sep and sep.group(0).strip() not in ("-", "–", "—"):
+        raise ValueError("no end date")
+    if end < start:
+        raise ValueError("end before start")
+    if (end - start).days > 60:
+        raise ValueError("longer than 60 days")
+    return start, end, rest.strip(" ,:;-–—")
+
+
+@functools.lru_cache(maxsize=16)
+def _holiday_calendar(country: str, year: int):
+    try:
+        return holiday_calendars.country_holidays(country, years=year)
+    except (NotImplementedError, KeyError):
+        log.warning("No public holiday calendar for HOLIDAYS_COUNTRY=%s", country)
+        return {}
+
+
+def public_holiday(country: str, day: date) -> str | None:
+    if not country:
+        return None
+    return _holiday_calendar(country.upper(), day.year).get(day)
 
 
 def monday_of(day: date) -> date:
@@ -208,6 +301,11 @@ class Config:
     garmin_profile: str
     garmin_days: int
     telegram_base_url: str = ""  # empty = api.telegram.org; set for a local Bot API server
+    model_check: str = "haiku"
+    garmin_auto_done: bool = True
+    holidays_country: str = "SG"
+    safety_review: bool = True
+    claude_retry_delay: float = 5.0
     ask_timeout: int = 240
     plan_timeout: int = 600
     secrets: list[str] = dataclasses.field(default_factory=list, repr=False)
@@ -286,6 +384,11 @@ class Config:
             garmin_profile=get("GARMIN_PROFILE", "Me"),
             garmin_days=max(1, garmin_days),
             telegram_base_url=get("TELEGRAM_BASE_URL"),
+            model_check=get("CLAUDE_MODEL_CHECK", "haiku"),
+            garmin_auto_done=parse_switch(env.get("GARMIN_AUTO_DONE"), True),
+            holidays_country=get("HOLIDAYS_COUNTRY", "SG") if "HOLIDAYS_COUNTRY" not in env else _clean(env["HOLIDAYS_COUNTRY"]),
+            safety_review=parse_switch(env.get("SAFETY_REVIEW"), True),
+            claude_retry_delay=float(get("CLAUDE_RETRY_DELAY", "5")),
             secrets=[
                 v
                 for v in (
@@ -493,6 +596,14 @@ class Store:
         existing = self.load_checkin(sunday)
         combined = f"{existing}\n\n{text.strip()}" if existing else text.strip()
         self._write(self.checkin_path(sunday), combined + "\n")
+
+    # -- days away ------------------------------------------------------------
+
+    def away(self) -> list[dict]:
+        return self.read_json("away.json", [])
+
+    def set_away(self, periods: list[dict]) -> None:
+        self.write_json("away.json", sorted(periods, key=lambda p: p["start"]))
 
     # -- chat memory --------------------------------------------------------
 
@@ -817,6 +928,86 @@ def shoulder_trend(ratings: list[dict], today: date) -> str:
     return " ".join(parts)
 
 
+SPARK = "▁▂▃▄▅▆▇█"
+
+
+def weekly_sparkline(ratings: list[dict], today: date, weeks: int = 8) -> str | None:
+    """Weekly average shoulder rating as a tiny bar chart, oldest week first (· = no rating)."""
+    this_monday = monday_of(today)
+    bars, values = [], []
+    for k in range(weeks - 1, -1, -1):
+        start = this_monday - timedelta(weeks=k)
+        week = [r["rating"] for r in ratings if (d := _row_date(r)) and start <= d < start + timedelta(days=7)]
+        if week:
+            avg = sum(week) / len(week)
+            values.append(avg)
+            bars.append(SPARK[min(len(SPARK) - 1, round(avg / 10 * (len(SPARK) - 1)))])
+        else:
+            bars.append("·")
+    if not values:
+        return None
+    return f"{''.join(bars)}  (weekly average, last {weeks} weeks, oldest first)"
+
+
+WEIGHT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(kg|kgs|kilos?|lb|lbs)\b", re.IGNORECASE)
+SETS_RE = re.compile(r"(\d+)\s*[x×]\s*(\d+)", re.IGNORECASE)
+
+
+def _norm_exercise(name: str) -> str:
+    words = re.sub(r"[^a-z0-9 ]+", " ", name.lower()).split()
+    if words and len(words[-1]) > 3 and words[-1].endswith("s") and not words[-1].endswith("ss"):
+        words[-1] = words[-1][:-1]  # rows -> row, dips -> dip
+    return " ".join(words)
+
+
+def parse_log_items(text: str) -> list[dict]:
+    """'rows 22kg 3x10, floor press 14kg 3x8 felt easy' -> one item per exercise."""
+    items = []
+    for segment in re.split(r"[,;\n]|\bthen\b", text):
+        weight, sets = WEIGHT_RE.search(segment), SETS_RE.search(segment)
+        if not (weight or sets):
+            continue
+        cut = min(m.start() for m in (weight, sets) if m)
+        name = re.sub(r"^[\s\d.)-]+", "", segment[:cut]).strip(" -:@")
+        if not re.search(r"[A-Za-z]", name):  # "45 lb landmine press 3x8": the name comes after
+            first, other = sorted((m for m in (weight, sets) if m), key=lambda m: m.start())[0], None
+            other = next((m for m in (weight, sets) if m and m is not first and m.start() > first.end()), None)
+            between = segment[first.end(): other.start() if other else len(segment)]
+            name = re.split(r"\s\d", between, maxsplit=1)[0].strip(" -:@,")
+        if not name or not re.search(r"[A-Za-z]", name):
+            continue
+        kg = None
+        if weight:
+            kg = float(weight[1]) * (0.4536 if weight[2].lower().startswith("lb") else 1)
+            kg = round(kg, 1)
+        items.append({
+            "name": name, "key": _norm_exercise(name), "kg": kg,
+            "sets": int(sets[1]) if sets else None, "reps": int(sets[2]) if sets else None,
+        })
+    return items
+
+
+def _fmt_kg(kg: float | None) -> str:
+    return "" if kg is None else (f"{kg:g} kg")
+
+
+def _fmt_item(item: dict) -> str:
+    parts = [p for p in (_fmt_kg(item["kg"]), f"{item['sets']} x {item['reps']}" if item["sets"] else "") if p]
+    return " ".join(parts)
+
+
+def progress_history(logs: list[dict], since: date | None = None) -> dict[str, list[dict]]:
+    """Exercise -> dated entries parsed from the workout logs, oldest first."""
+    history: dict[str, list[dict]] = {}
+    for row in logs:
+        d = _row_date(row)
+        if not d or (since and d < since):
+            continue
+        for item in parse_log_items(str(row.get("text", ""))):
+            history.setdefault(item["key"], []).append({**item, "date": d})
+    return history
+
+
 def shoulder_rising(ratings: list[dict], today: date) -> bool:
     return "rising" in shoulder_trend(ratings, today) or "went up" in shoulder_trend(ratings, today)
 
@@ -1002,9 +1193,10 @@ async def typing(bot, chat_id: int):
 
 
 class ClaudeError(Exception):
-    def __init__(self, user_message: str, detail: str = ""):
+    def __init__(self, user_message: str, detail: str = "", transient: bool = False):
         super().__init__(detail or user_message)
         self.user_message = user_message
+        self.transient = transient  # worth one automatic retry
 
 
 AUTH_RE = re.compile(
@@ -1016,6 +1208,14 @@ LIMIT_RE = re.compile(
     r"usage limit|rate limit|\b429\b|overloaded|\b529\b|quota|credit balance|limit reached",
     re.IGNORECASE,
 )
+# Brief problems on Anthropic's side or the network: one automatic retry usually works.
+TRANSIENT_RE = re.compile(
+    r"overloaded|\b529\b|\b50[0234]\b|internal server error|service unavailable|bad gateway|"
+    r"api_error|ECONNRESET|ETIMEDOUT|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|socket hang up|fetch failed|"
+    r"connection error|network is unreachable",
+    re.IGNORECASE,
+)
+PERMANENT_RE = re.compile(r"usage limit|rate limit|\b429\b|quota|credit balance|limit reached", re.IGNORECASE)
 
 MSG_AUTH = (
     "Claude Code could not sign in, so the token probably needs renewing. On your computer run "
@@ -1054,7 +1254,7 @@ class ClaudeRunner:
         return env
 
     def command(self, kind: str, prompt_file: str) -> list[str]:
-        model = self.cfg.model_ask if kind == "ask" else self.cfg.model_plan
+        model = {"ask": self.cfg.model_ask, "review": self.cfg.model_check}.get(kind, self.cfg.model_plan)
         cmd = [
             self.cfg.claude_bin,
             "-p",
@@ -1096,17 +1296,25 @@ class ClaudeRunner:
         return proc.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
 
     async def run(self, system_prompt: str, message: str, kind: str) -> str:
-        """kind is 'ask' (web search on) or 'plan' (no tools). Returns the reply text."""
-        try:
-            result = await self._run(system_prompt, message, kind)
-        except ClaudeError as exc:
-            self.last_call = {"at": now_in(self.cfg.tz), "kind": kind, "ok": False, "message": exc.user_message}
-            raise
-        self.last_call = {"at": now_in(self.cfg.tz), "kind": kind, "ok": True, "message": ""}
-        return result
+        """kind is 'ask' (web search on), 'plan' or 'review' (no tools). Returns the reply text.
+
+        A brief failure (overloaded, a 5xx error, a network blip) is retried once."""
+        for attempt in (1, 2):
+            try:
+                result = await self._run(system_prompt, message, kind)
+            except ClaudeError as exc:
+                if exc.transient and attempt == 1:
+                    log.warning("claude %s failed briefly, retrying once in %ss", kind, self.cfg.claude_retry_delay)
+                    await asyncio.sleep(self.cfg.claude_retry_delay)
+                    continue
+                self.last_call = {"at": now_in(self.cfg.tz), "kind": kind, "ok": False, "message": exc.user_message}
+                raise
+            self.last_call = {"at": now_in(self.cfg.tz), "kind": kind, "ok": True, "message": ""}
+            return result
+        raise AssertionError("unreachable")
 
     async def _run(self, system_prompt: str, message: str, kind: str) -> str:
-        timeout = self.cfg.ask_timeout if kind == "ask" else self.cfg.plan_timeout
+        timeout = self.cfg.plan_timeout if kind == "plan" else self.cfg.ask_timeout
         fd, prompt_file = tempfile.mkstemp(prefix="coach-system-", suffix=".md")
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(system_prompt)
@@ -1132,6 +1340,14 @@ class ClaudeRunner:
         return self._parse(code, out, err, kind, took)
 
     def _parse(self, code: int, out: str, err: str, kind: str, took: float) -> str:
+        try:
+            return self._parse_result(code, out, err, kind, took)
+        except ClaudeError as exc:
+            text = f"{exc} {out[-2000:]} {err[-2000:]}"
+            exc.transient = bool(TRANSIENT_RE.search(text)) and not PERMANENT_RE.search(text) and not AUTH_RE.search(text)
+            raise
+
+    def _parse_result(self, code: int, out: str, err: str, kind: str, took: float) -> str:
         data = None
         with contextlib.suppress(ValueError):
             data = json.loads(out)
@@ -1170,7 +1386,7 @@ class ClaudeRunner:
             detail = redact(f"{subtype}: {result or err}".strip()[:500], self.cfg.secrets)
             log.warning("claude (%s) reported an error: %s", kind, detail)
             if subtype == "error_max_turns":
-                raise ClaudeError(
+                raise ClaudeError(  # not worth retrying: the same request would run out again
                     "Claude Code ran out of steps before it finished. Please try again, or ask "
                     "in a simpler way.",
                     detail,
@@ -1216,6 +1432,12 @@ class ClaudeRunner:
 # ---------------------------------------------------------------------------
 # Garmin data from garmin-monitor (read only)
 # ---------------------------------------------------------------------------
+
+# Garmin activity types that count as a training session for the 9pm check.
+WORKOUT_TYPES = (
+    "strength", "fitness_equipment", "hiit", "cardio", "swim", "run", "cycling", "basketball",
+    "rowing", "elliptical", "stair", "boxing", "tennis", "pickleball", "badminton",
+)
 
 GARMIN_COLUMNS = (
     "day, resting_hr, resting_hr_7d_avg, sleep_seconds, sleep_score, hrv_last_night, "
@@ -1272,6 +1494,50 @@ class GarminReader:
 
     def profiles(self) -> list[str]:
         return [r[0] for r in self._query("SELECT DISTINCT profile FROM daily_snapshots ORDER BY profile")]
+
+    def week_stats(self, start: date, end: date) -> list[str]:
+        """Runs, sleep and resting heart rate between two dates, as short lines."""
+        try:
+            rows = self.rows(start, end)
+        except (FileNotFoundError, sqlite3.Error):
+            return []
+        if not rows:
+            return []
+        km, runs, seen = 0.0, 0, set()
+        for row in rows:
+            for act in _activities(row):
+                key = act.get("activity_id") or (act.get("start"), act.get("type"))
+                if "run" in str(act.get("type", "")).lower() and act.get("source") != "auto_detected" and key not in seen:
+                    seen.add(key)
+                    runs += 1
+                    km += (act.get("distance_m") or 0) / 1000
+        sleep = [r["sleep_seconds"] / 3600 for r in rows if isinstance(r.get("sleep_seconds"), (int, float)) and r["sleep_seconds"] > 0]
+        rhr = [r["resting_hr"] for r in rows if isinstance(r.get("resting_hr"), (int, float))]
+        out = [f"Runs: {runs}, {km:.1f} km" if runs else "Runs: none recorded"]
+        if sleep:
+            out.append(f"Sleep: {sum(sleep) / len(sleep):.1f} h a night on average")
+        if rhr:
+            out.append(f"Resting heart rate: {sum(rhr) / len(rhr):.0f} on average")
+        return out
+
+    def workouts(self, day: date, min_minutes: int = 15) -> list[dict]:
+        """Workouts recorded on the watch that day (gym, swim, run, ride, basketball...).
+
+        Returns [] when the database cannot be read, so callers never fail on Garmin."""
+        try:
+            rows = self.rows(day, day)
+        except (FileNotFoundError, sqlite3.Error):
+            return []
+        out = []
+        for row in rows:
+            for act in _activities(row):
+                kind = str(act.get("type") or "").lower()
+                minutes = (act.get("duration_s") or 0) / 60 if isinstance(act.get("duration_s"), (int, float)) else 0
+                if act.get("source") == "auto_detected" or minutes < min_minutes:
+                    continue
+                if any(word in kind for word in WORKOUT_TYPES):
+                    out.append({"type": kind, "minutes": round(minutes), "name": act.get("name") or kind})
+        return out
 
     def summary(self, today: date, days: int, tz: ZoneInfo) -> GarminSummary:
         try:
@@ -1499,6 +1765,16 @@ def coach_prompt(cfg: Config) -> str:
     )
 
 
+SAFETY_MARK = "SAFETY REVIEW"
+
+
+def injury_rules() -> str:
+    """The Injury section of the coach prompt, for the safety review."""
+    start = COACH_PROMPT.index("Injury\n")
+    end = COACH_PROMPT.index("\n\nBasketball")
+    return COACH_PROMPT[start:end].strip()
+
+
 PLAN_FORMAT_RULES = """Format rules. The bot reads your plan automatically, so follow them exactly:
 1. Cover all seven days, Monday to Sunday, in order.
 2. Start each day with one line in exactly this form: 📅 Monday: Push. Use the day name, a colon and the day's focus. Mark rest days in the focus, for example 📅 Saturday: Basketball or rest, or 📅 Sunday: Rest or light mobility.
@@ -1580,6 +1856,35 @@ class Coach:
     def trend(self) -> str:
         return shoulder_trend(self.store.ratings(), self.today())
 
+    def week_in_numbers(self, monday: date) -> str:
+        """Sessions, logs, shoulder and Garmin totals for one week (Monday to Sunday)."""
+        sunday = monday + timedelta(days=6)
+        in_week = lambda d: d is not None and monday <= d <= sunday  # noqa: E731
+        sessions = [v for k, v in self.store.sessions().items() if in_week(_row_date({"date": k}))]
+        done = sum(1 for v in sessions if v.get("status") == "done")
+        skipped = sum(1 for v in sessions if v.get("status") == "skipped")
+        plan = self.store.load_plan(monday)
+        planned = sum(1 for d in parse_plan(plan or "").days.values() if not d.is_rest) if plan else None
+        lines = ["**Last week in numbers**"]
+        session_line = f"• Sessions: {done} done, {skipped} skipped"
+        if planned:
+            session_line += f" ({planned} training days planned)"
+        lines.append(session_line)
+        logs = [r for r in self.store.logs() if in_week(_row_date(r))]
+        lines.append(f"• Workout logs: {len(logs)}")
+        ratings = self.store.ratings()
+        week = [r["rating"] for r in ratings if in_week(_row_date(r))]
+        before = [r["rating"] for r in ratings if (d := _row_date(r)) and monday - timedelta(days=7) <= d < monday]
+        if week:
+            text = f"• Left shoulder: average {sum(week) / len(week):.1f}"
+            if before:
+                text += f" ({sum(before) / len(before):.1f} the week before)"
+            lines.append(text)
+        stats = self.garmin.week_stats(monday, sunday)
+        if stats:
+            lines += [f"• {line}" for line in stats]
+        return "\n".join(lines)
+
     def extra_context(self, now: datetime) -> list[str]:
         today = now.date()
         since = today - timedelta(days=13)
@@ -1594,6 +1899,14 @@ class Coach:
             parts.append("My workout logs from the last 14 days:\n" + "\n".join(lines))
         else:
             parts.append("My workout logs from the last 14 days: none.")
+        history = progress_history(self.store.logs(), today - timedelta(weeks=8))
+        if history:
+            recent = sorted(history.items(), key=lambda kv: kv[1][-1]["date"], reverse=True)[:12]
+            lines = [
+                f"• {entries[-1]['name']}: " + ", ".join(f"{_fmt_item(e)} ({fmt_day(e['date'])})" for e in entries[-4:])
+                for _, entries in recent
+            ]
+            parts.append("Weights and reps from my logs, last 8 weeks (oldest to newest per exercise):\n" + "\n".join(lines))
         ratings = self.store.ratings(since)
         if ratings:
             lines = [
@@ -1612,10 +1925,47 @@ class Coach:
         checkin = self.store.load_checkin(last_sunday)
         if checkin:
             parts.append(f"My Sunday check in answer from {fmt_day(last_sunday)}:\n{checkin}")
+        off = self.days_off(today, today + timedelta(days=13))
+        if off:
+            parts.append(
+                "Days off in the next two weeks (away, on leave or a public holiday). On these days "
+                "give a hotel gym or bodyweight version, or move the session:\n"
+                + "\n".join(f"{fmt_day(d)}: {label}" for d, label in off)
+            )
         garmin = self.garmin_context(today)
         if garmin:
             parts.append(garmin)
         return parts
+
+    def holiday(self, day: date) -> str | None:
+        return public_holiday(self.cfg.holidays_country, day)
+
+    def away_on(self, day: date) -> dict | None:
+        for period in self.store.away():
+            if period["start"] <= day.isoformat() <= period["end"]:
+                return period
+        return None
+
+    def days_off(self, start: date, end: date) -> list[tuple[date, str]]:
+        """Days away or public holidays between two dates, with a short label."""
+        out = []
+        day = start
+        while day <= end:
+            away = self.away_on(day)
+            holiday = self.holiday(day)
+            if away:
+                out.append((day, "away" + (f" ({away['note']})" if away.get("note") else "")))
+            elif holiday:
+                out.append((day, f"public holiday ({holiday})"))
+            day += timedelta(days=1)
+        return out
+
+    def day_off_line(self, day: date) -> str | None:
+        away = self.away_on(day)
+        if away:
+            return "✈️ You are away today" + (f" ({away['note']})" if away.get("note") else "") + "."
+        holiday = self.holiday(day)
+        return f"🎉 Public holiday today: {holiday}." if holiday else None
 
     def garmin_summary(self, today: date) -> GarminSummary:
         return self.garmin.summary(today, self.cfg.garmin_days, self.cfg.tz)
@@ -1780,6 +2130,14 @@ class Coach:
         lines.append(
             f"My Sunday check in answer: {checkin}" if checkin else "I did not send a Sunday check in answer this week."
         )
+        off = self.days_off(monday, sunday)
+        if off:
+            lines += [
+                "",
+                "Days off this week. On these days give a hotel gym or bodyweight version, or move "
+                "the session, as your rules say:",
+                *[f"{fmt_day(d)}: {label}" for d, label in off],
+            ]
         if notes.strip():
             lines += ["", f"My notes for this plan: {notes.strip()}"]
         preface_rule = ", except the short split comparison" if not split else ""
@@ -1803,14 +2161,47 @@ class Coach:
             ]
         )
 
+    async def safety_review(self, text: str) -> list[str]:
+        """A second opinion from a small model: plan lines that break the injury rules."""
+        injury, _ = self.injury_text()
+        system = (
+            "You check weekly training plans for safety before a coach bot sends them. You never "
+            f"write or rewrite plans.\n\nThe athlete's injury rules:\n{injury_rules()}\n\n"
+            f"Latest injury notes: {injury.strip() or 'none'}"
+        )
+        message = (
+            f"{SAFETY_MARK}\n"
+            "Check every exercise, warm up and finisher in the plan below against the injury rules. "
+            "Flag only movements the rules leave out, or ones that clearly load the left shoulder "
+            "heavily. Rehab exercises, swaps, notes that say what to avoid, and single arm work "
+            "with the left arm kept light are fine.\n"
+            "If nothing breaks the rules, reply with exactly: OK\n"
+            "Otherwise reply with one line per problem and nothing else, in this form:\n"
+            "PROBLEM: <day>: <exercise line>: <which rule it breaks>\n\n"
+            f"The plan:\n{text}"
+        )
+        reply = await self.runner.run(system, message, "review")
+        return [
+            "Safety review: " + line.split(":", 1)[1].strip()
+            for line in reply.splitlines()
+            if line.strip().upper().startswith("PROBLEM:") and line.split(":", 1)[1].strip()
+        ]
+
     async def generate_plan(
         self, monday: date, request: str, *, kind: str, save_split: bool, notes: str = ""
     ) -> PlanResult:
-        """Run Claude, check the plan, fix it once if needed, then save it."""
+        """Run Claude, check the plan (rules, then a safety review), fix it once if needed, save it."""
         had_split = bool(self.store.state().get("split"))
         system = self.system_prompt(planning=monday)
         text = clean_reply(await self.runner.run(system, request, "plan"))
         problems = self.plan_problems(text)
+        reviewed: list[str] = []
+        if self.cfg.safety_review and self.cfg.blocked_movements:
+            try:
+                reviewed = await self.safety_review(text)
+            except ClaudeError as exc:
+                log.warning("The safety review failed, the rule check still applies: %s", exc.user_message)
+            problems += reviewed
         fixed = False
         warnings: list[str] = []
         if problems:
@@ -1841,6 +2232,7 @@ class Coach:
             "model": self.cfg.model_plan,
             "notes": notes,
             "fixed_once": fixed,
+            "safety_review": reviewed,
             "warnings": warnings,
         }
         self.store.save_plan(monday, text, meta, now.strftime("%Y%m%d-%H%M%S"))
@@ -1981,11 +2373,12 @@ class Coach:
                 f"the whole week.\n\n{plan}"
             )
         status = self.store.sessions().get(today.isoformat(), {}).get("status")
+        prefix = [line for line in [self.day_off_line(today)] if line]
         if status == "done":
-            return "✅ Already marked done today.\n\n" + day.text
+            prefix.append("✅ Already marked done today.")
         if status == "skipped":
-            return "⏭ Marked as skipped today.\n\n" + day.text
-        return day.text
+            prefix.append("⏭ Marked as skipped today.")
+        return "\n".join(prefix) + "\n\n" + day.text if prefix else day.text
 
     def week_text(self) -> str:
         today = self.today()
@@ -2049,7 +2442,9 @@ COMMANDS = [
     ("log", "Log what you did"),
     ("done", "Mark today's session finished"),
     ("shoulder", "Your shoulder rating log"),
+    ("progress", "Weights from your logs"),
     ("injury", "Show or replace your injury notes"),
+    ("away", "Days away, on leave or travelling"),
     ("profile", "What the coach knows about you"),
     ("status", "Claude Code, sign in and reminders"),
     ("reset", "Clear the chat memory"),
@@ -2207,7 +2602,49 @@ def shoulder_log_text(coach: Coach) -> str:
         note = f" ({r['note']})" if r.get("note") else ""
         lines.append(f"{when}, {r.get('time', '')}: {r['rating']}/10{note}")
     lines += ["", "Trend: " + coach.trend()]
+    spark = weekly_sparkline(ratings, coach.today())
+    if spark:
+        lines.append(spark)
     return "\n".join(lines)
+
+
+def shoulder_csv(coach: Coach) -> bytes:
+    import csv
+    import io
+
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(["date", "time", "rating (0 = no pain / 10 = worst)", "note"])
+    for r in coach.store.ratings():
+        writer.writerow([r.get("date"), r.get("time", ""), r["rating"], r.get("note", "")])
+    return out.getvalue().encode("utf-8-sig")  # opens cleanly in Excel and Numbers
+
+
+def progress_text(coach: Coach) -> str:
+    history = progress_history(coach.store.logs())
+    if not history:
+        return (
+            "No weights in your logs yet. Log them like this and I will track them:\n"
+            "/log rows 22kg 3x10, floor press 14kg 3x8 felt easy"
+        )
+    lines = ["**Progress from your logs** (first → latest)"]
+    for _, entries in sorted(history.items(), key=lambda kv: kv[1][-1]["date"], reverse=True):
+        first, last = entries[0], entries[-1]
+        name = last["name"][:1].upper() + last["name"][1:]
+        if first["kg"] is not None and last["kg"] is not None and len(entries) > 1:
+            change = last["kg"] - first["kg"]
+            sign = "+" if change > 0 else ""
+            detail = f"{first['kg']:g} → {last['kg']:g} kg ({sign}{change:g} kg)"
+        else:
+            detail = _fmt_item(last)
+        sets = f", last {last['sets']} x {last['reps']}" if last["sets"] and first["kg"] is not None and len(entries) > 1 else ""
+        count = f"{len(entries)} session{'s' if len(entries) > 1 else ''}"
+        lines.append(f"• {name}: {detail}{sets} · {count}, latest {fmt_day(last['date'])}")
+    return "\n".join(lines)
+
+
+async def cmd_progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await reply(update, context, progress_text(coach_of(context)))
 
 
 def rating_feedback(coach: Coach, rating: int) -> str:
@@ -2239,6 +2676,12 @@ async def cmd_shoulder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await reply(update, context, f"Left shoulder {rating}/10 saved.\n\n" + rating_feedback(coach, rating))
         return
     await reply(update, context, shoulder_log_text(coach))
+    if coach.store.ratings():
+        await context.bot.send_document(
+            update.effective_chat.id,
+            document=InputFile(shoulder_csv(coach), filename=f"shoulder-ratings-{coach.today().isoformat()}.csv"),
+            caption="All your ratings as a spreadsheet file, for your physio.",
+        )
 
 
 async def on_rate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2355,6 +2798,55 @@ async def cmd_injury(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     coach.store.set_injury(new, coach.now())
     await reply(update, context, "Injury notes saved. The coach will use them from now on.")
+
+
+def away_text(coach: Coach) -> str:
+    today = coach.today()
+    periods = [p for p in coach.store.away() if p["end"] >= today.isoformat()]
+    lines = []
+    if periods:
+        lines.append("**Days away**")
+        for p in periods:
+            start, end = date.fromisoformat(p["start"]), date.fromisoformat(p["end"])
+            span = fmt_day(start) if start == end else f"{fmt_day(start)} to {fmt_day(end)}"
+            lines.append(f"• {span}" + (f" ({p['note']})" if p.get("note") else ""))
+    else:
+        lines.append("No days away saved.")
+    holidays_ahead = [(d, label) for d, label in coach.days_off(today, today + timedelta(days=60)) if label.startswith("public")]
+    if holidays_ahead:
+        lines += ["", "**Public holidays in the next 60 days**"]
+        lines += [f"• {fmt_day(d)}: {label.removeprefix('public holiday (').rstrip(')')}" for d, label in holidays_ahead]
+    lines += ["", "Add days like this: /away 8 Oct to 10 Oct Bangkok trip, or /away thu fri. Clear them with /away clear."]
+    return "\n".join(lines)
+
+
+async def cmd_away(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    coach = coach_of(context)
+    arg = args_text(update)
+    today = coach.today()
+    if not arg:
+        await reply(update, context, away_text(coach))
+        return
+    if arg.lower() in ("clear", "none", "cancel"):
+        coach.store.set_away([p for p in coach.store.away() if p["end"] < today.isoformat()])
+        await reply(update, context, "Days away cleared.")
+        return
+    try:
+        start, end, note = parse_away(arg, today)
+    except ValueError:
+        await reply(update, context, "I could not read those dates. Try /away 8 Oct to 10 Oct Bangkok trip, /away thu fri, or /away tomorrow hotel gym only.")
+        return
+    periods = [p for p in coach.store.away() if p["end"] >= today.isoformat()]
+    periods.append({"start": start.isoformat(), "end": end.isoformat(), "note": note})
+    coach.store.set_away(periods)
+    span = fmt_day(start) if start == end else f"{fmt_day(start)} to {fmt_day(end)}"
+    text = f"Saved: away {span}" + (f" ({note})" if note else "") + "."
+    this_week = monday_of(today)
+    if start <= this_week + timedelta(days=6) and coach.store.load_plan(this_week):
+        text += " This week's plan was built before, so send /plan to rebuild it with a hotel gym or bodyweight version on those days."
+    else:
+        text += " The plan for that week will use a hotel gym or bodyweight version on those days."
+    await reply(update, context, text)
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2533,10 +3025,12 @@ def add_handlers(application: Application, concurrent: bool = True) -> None:
     application.add_handler(CommandHandler("log", cmd_log))
     application.add_handler(CommandHandler("done", cmd_done))
     application.add_handler(CommandHandler("shoulder", cmd_shoulder))
+    application.add_handler(CommandHandler("progress", cmd_progress))
     application.add_handler(CallbackQueryHandler(on_rate, pattern=r"^rate:"))
     application.add_handler(CallbackQueryHandler(on_check, pattern=r"^chk:", **slow))
     application.add_handler(CallbackQueryHandler(on_alt, pattern=r"^alt:", **slow))
     application.add_handler(CommandHandler("injury", cmd_injury))
+    application.add_handler(CommandHandler("away", cmd_away))
     application.add_handler(CommandHandler("profile", cmd_profile))
     application.add_handler(CommandHandler("status", cmd_status, **slow))
     application.add_handler(CommandHandler("reset", cmd_reset))
@@ -2641,6 +3135,9 @@ async def send_day_session(context: ContextTypes.DEFAULT_TYPE, heading: str, res
     else:
         text = f"{heading}\n\n{day.text}"
         markup = alt_keyboard(today)
+    off = coach.day_off_line(today)
+    if off and day is not None:
+        text = f"{off}\n{text}"
     note = coach.recovery_note(today, rest_day=bool(day and day.is_rest))
     if note:
         text += "\n\n" + note
@@ -2711,6 +3208,16 @@ async def job_evening_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     day = parse_plan(plan or "").days.get(today.weekday())
     if day and day.is_rest:
         return
+    workouts = coach.garmin.workouts(today) if coach.cfg.garmin_auto_done else []
+    if workouts:
+        coach.store.set_session(today, "done", coach.now(), "garmin")
+        seen = ", ".join(f"a {w['minutes']} min {w['type'].replace('_', ' ')} session" for w in workouts)
+        await owner_send(
+            context,
+            f"✅ Your watch shows {seen} today, so I marked today as done.\n\n{RATING_QUESTION}",
+            reply_markup=rating_keyboard(today),
+        )
+        return
     focus = f" ({day.focus})" if day else ""
     await owner_send(context, f"Did you train today{focus}?", reply_markup=check_keyboard(today))
 
@@ -2760,6 +3267,7 @@ async def build_next_week(context: ContextTypes.DEFAULT_TYPE, monday: date) -> N
         return
     heading = "🗓 Next week's plan was already built" if result.reused else "🗓 Next week is ready"
     text = coach.overview(result, f"{heading}. {coach.week_label(monday)}")
+    text += "\n\n" + coach.week_in_numbers(monday - timedelta(days=7))
     text += "\n\nLeft shoulder: " + coach.trend()
     if not coach.store.load_checkin(sunday):
         text += "\n\nI did not get a check in answer this week, so I built it without one."
