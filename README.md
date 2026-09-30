@@ -10,6 +10,18 @@ A private Telegram bot that coaches you like a personal trainer. It runs in Dock
 - Knows Singapore public holidays and the days you're away (`/away`), and plans a hotel gym or bodyweight version for them.
 - Tracks the weights you log (`/progress`), sends your shoulder ratings as a spreadsheet file for your physio, and adds "last week in numbers" to the Sunday overview.
 
+## How it fits together
+
+![Architecture: a Docker container on the UGREEN NAS runs the Telegram bot, its reminders, the plan builder with the shoulder-injury check, and the claude -p runner. It reads garmin-monitor's database read-only and keeps everything it remembers in ./data.](docs/architecture.drawio.svg)
+
+1. **You** talk to the bot in a private Telegram chat: commands, questions and button presses.
+2. **Reminders** run on a schedule (Singapore time) and message you: the day's workout, the pre-gym nudge, the 9pm check and the Sunday check-in.
+3. **The plan builder** writes next week's plan every Sunday, and **the injury check** reviews every line against your shoulder rules before it's saved.
+4. **Every AI call** runs `claude -p` with your injury notes, this week's plan, recent logs, shoulder ratings and 7 days of Garmin data.
+5. **Plans, logs and check-ins** are saved as plain files in `./data`. garmin-monitor's `monitor.db` is only ever read.
+
+To edit the diagram, open `docs/architecture.drawio.svg` in [draw.io](https://app.diagrams.net) (File → Open from → Device) or in VS Code with the Draw.io Integration extension. Save it in the same format, and GitHub shows the updated picture.
+
 ## Files
 
 | File | What it is |
