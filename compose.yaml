@@ -4,11 +4,14 @@ services:
     image: gym-coach-bot:local
     container_name: gym-coach-bot
     restart: unless-stopped
+    init: true   # reaps helper processes that claude -p leaves behind
     env_file: bot.env
     volumes:
       # Plans, logs, shoulder ratings, check ins and chat memory. Include it in your NAS backups.
       - ./data:/data
       # garmin-monitor's data folder, read only. The bot reads monitor.db from it.
+      # Change the left side if garmin-monitor lives elsewhere (Docker creates an
+      # empty folder if this path does not exist, and /status then says so).
       - /volume1/docker/garmin-monitor/data:/garmin:ro
     logging:
       driver: json-file

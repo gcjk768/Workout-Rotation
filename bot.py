@@ -34,7 +34,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction, ChatType, ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -145,7 +145,7 @@ DEFAULT_ROTATION = "dumbbells, cables, machines, barbell and kettlebells"
 
 @dataclasses.dataclass
 class Config:
-    telegram_token: str
+    telegram_token: str = dataclasses.field(repr=False)
     allowed_ids: list[int]
     tz: ZoneInfo
     data_dir: Path
@@ -181,7 +181,7 @@ class Config:
     garmin_days: int
     ask_timeout: int = 240
     plan_timeout: int = 600
-    secrets: list[str] = dataclasses.field(default_factory=list)
+    secrets: list[str] = dataclasses.field(default_factory=list, repr=False)
 
     @property
     def owner_id(self) -> int | None:
@@ -903,6 +903,7 @@ class ClaudeRunner:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self._slots = asyncio.Semaphore(2)
+        self._status_slot = asyncio.Semaphore(1)  # /status checks: one small process at a time
         self.last_call: dict | None = None  # outcome of the latest real call, for /status
 
     def child_env(self) -> dict[str, str]:
@@ -1044,7 +1045,7 @@ class ClaudeRunner:
                 raise ClaudeError(MSG_LIMIT, detail)
             if NETWORK_RE.search(text):
                 raise ClaudeError(MSG_NETWORK, detail)
-            snippet = (result or subtype or "unknown error").strip()[:200]
+            snippet = redact((result or subtype or "unknown error").strip()[:200], self.cfg.secrets)
             raise ClaudeError(f"Claude Code reported an error: {snippet}", detail)
         if not result.strip():
             raise ClaudeError("Claude Code sent an empty reply. Please try again.")
@@ -1052,14 +1053,16 @@ class ClaudeRunner:
 
     async def version(self) -> str:
         try:
-            code, out, err = await self._exec([self.cfg.claude_bin, "--version"], None, 30)
+            async with self._status_slot:
+                code, out, err = await self._exec([self.cfg.claude_bin, "--version"], None, 30)
         except (FileNotFoundError, asyncio.TimeoutError, OSError) as exc:
             return f"not available ({type(exc).__name__})"
         return (out or err).strip().splitlines()[0] if (out or err).strip() else f"exit {code}"
 
     async def auth_status(self) -> tuple[bool, str]:
         try:
-            code, out, err = await self._exec([self.cfg.claude_bin, "auth", "status"], None, 30)
+            async with self._status_slot:
+                code, out, err = await self._exec([self.cfg.claude_bin, "auth", "status"], None, 30)
         except (FileNotFoundError, asyncio.TimeoutError, OSError) as exc:
             return False, f"could not run claude auth status ({type(exc).__name__})"
         data = None
@@ -1378,6 +1381,7 @@ class PlanResult:
     text: str
     meta: dict
     warnings: list[str]
+    reused: bool = False  # an existing plan was kept instead of building a new one
 
 
 class PlanBusy(Exception):
@@ -1705,10 +1709,19 @@ class Coach:
         self.store.update_state(**state_update)
         return PlanResult(monday, text, meta, warnings)
 
-    async def build_week(self, monday: date, notes: str = "", *, kind: str = "build", wait: bool = False) -> PlanResult:
+    async def build_week(
+        self, monday: date, notes: str = "", *, kind: str = "build", wait: bool = False, keep_if=None
+    ) -> PlanResult:
+        """keep_if(meta) -> True keeps an existing plan. It is checked after taking the lock,
+        so a scheduled build never overwrites a plan the user built a moment earlier."""
         if self.plan_lock.locked() and not wait:
             raise PlanBusy()
         async with self.plan_lock:
+            existing = self.store.load_plan(monday)
+            if existing and keep_if is not None:
+                meta = self.store.load_plan_meta(monday)
+                if keep_if(meta):
+                    return PlanResult(monday, existing, meta, meta.get("warnings", []), reused=True)
             if not self.program_start():
                 self.store.update_state(program_start=monday.isoformat())
             week = self.week_number(monday)
@@ -1921,27 +1934,35 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, r
 
 
 async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Only ALLOWED_USER_IDS get through. Everyone else learns their own ID."""
+    """Only ALLOWED_USER_IDS in private chats get through. Everyone else learns their own ID.
+
+    Every path that does not return raises ApplicationHandlerStop, even when the reply
+    to a stranger fails, so no other handler ever runs for them.
+    """
     coach = coach_of(context)
     user = update.effective_user
-    if user is not None and user.id in coach.cfg.allowed_ids:
+    chat = update.effective_chat
+    private = chat is not None and chat.type == ChatType.PRIVATE
+    fresh = update.message is not None or update.callback_query is not None  # not edits
+    if user is not None and user.id in coach.cfg.allowed_ids and private and fresh:
         return
-    if user is not None:
-        if update.callback_query:
-            with contextlib.suppress(Exception):
+    try:
+        if user is not None and private and user.id not in coach.cfg.allowed_ids:
+            if update.callback_query:
                 await update.callback_query.answer("This is a private bot.")
-        msg = update.effective_message
-        if msg and (msg.chat.type == ChatType.PRIVATE or (msg.text or "").startswith("/")):
-            recent = context.application.bot_data.setdefault("stranger_replies", {})
-            stamp = coach.now().timestamp()
-            if stamp - recent.get(user.id, 0) > 30:
-                recent[user.id] = stamp
-                log.info("Message from a user who is not allowed: %s", user.id)
-                await context.bot.send_message(
-                    msg.chat.id,
-                    f"Sorry, this is a private bot. Your Telegram user ID is <code>{user.id}</code>.",
-                    parse_mode=ParseMode.HTML,
-                )
+            elif update.message:
+                recent = context.application.bot_data.setdefault("stranger_replies", {})
+                stamp = coach.now().timestamp()
+                if stamp - recent.get(user.id, 0) > 30:
+                    recent[user.id] = stamp
+                    log.info("Message from a user who is not allowed: %s", user.id)
+                    await context.bot.send_message(
+                        chat.id,
+                        f"Sorry, this is a private bot. Your Telegram user ID is <code>{user.id}</code>.",
+                        parse_mode=ParseMode.HTML,
+                    )
+    except Exception as exc:  # noqa: BLE001 - never let a failed reply open the gate
+        log.warning("Could not answer a user who is not allowed: %s", exc)
     raise ApplicationHandlerStop
 
 
@@ -2078,6 +2099,8 @@ async def on_rate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         _, day_raw, value = query.data.split(":")
         day, rating = date.fromisoformat(day_raw), int(value)
+        if not 0 <= rating <= 10:
+            raise ValueError(rating)
     except ValueError:
         await query.answer()
         return
@@ -2246,7 +2269,8 @@ def fmt_when(dt: datetime | None) -> str:
 
 
 async def status_text(coach: Coach, application: Application) -> str:
-    version, (signed_in, auth) = await asyncio.gather(coach.runner.version(), coach.runner.auth_status())
+    version = await coach.runner.version()
+    signed_in, auth = await coach.runner.auth_status()
     cfg = coach.cfg
     lines = [
         "**Claude Code**",
@@ -2315,6 +2339,9 @@ async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update is None and isinstance(context.error, NetworkError):
+        log.warning("Telegram network problem, retrying: %s", context.error)
+        return
     log.error("Unhandled error", exc_info=context.error)
     if isinstance(update, Update) and update.effective_chat:
         with contextlib.suppress(Exception):
@@ -2331,6 +2358,9 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def post_init(application: Application) -> None:
     await application.bot.set_my_commands([BotCommand(name, desc) for name, desc in COMMANDS])
     coach: Coach = application.bot_data["coach"]
+    for leftover in Path(tempfile.gettempdir()).glob("coach-system-*.md"):
+        with contextlib.suppress(OSError):
+            leftover.unlink()  # left behind if the container was killed mid call
     work = coach.cfg.work_dir
     work.mkdir(parents=True, exist_ok=True)
     if any(work.iterdir()):
@@ -2421,7 +2451,7 @@ async def job_session_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
             await owner_send(context, "No training plan yet. Send /plan to build your first week.")
             return
         try:
-            await coach.build_week(monday, kind="build", wait=True)
+            await coach.build_week(monday, kind="build", wait=True, keep_if=lambda meta: True)
         except ClaudeError as exc:
             await owner_send(context, f"This week has no plan and I could not build one. {exc.user_message} Send /plan to try again.")
             return
@@ -2488,18 +2518,16 @@ async def build_next_week(context: ContextTypes.DEFAULT_TYPE, monday: date) -> N
     sunday = monday - timedelta(days=1)
     st = coach.store.state().get("checkin") or {}
     answered_at = st.get("answered_at") if st.get("sunday") == sunday.isoformat() else None
-    existing = coach.store.load_plan(monday)
-    meta = coach.store.load_plan_meta(monday)
-    if existing and (answered_at is None or meta.get("built_at", "") >= answered_at):
-        result = PlanResult(monday, existing, meta, meta.get("warnings", []))
-        heading = "🗓 Next week's plan was already built"
-    else:
-        try:
-            result = await coach.build_week(monday, kind="scheduled", wait=True)
-        except ClaudeError as exc:
-            await owner_send(context, f"I could not build next week's plan. {exc.user_message} Send /nextweek to try again.")
-            return
-        heading = "🗓 Next week is ready"
+
+    def keep(meta: dict) -> bool:  # a plan built after the check in answer is kept
+        return answered_at is None or meta.get("built_at", "") >= answered_at
+
+    try:
+        result = await coach.build_week(monday, kind="scheduled", wait=True, keep_if=keep)
+    except ClaudeError as exc:
+        await owner_send(context, f"I could not build next week's plan. {exc.user_message} Send /nextweek to try again.")
+        return
+    heading = "🗓 Next week's plan was already built" if result.reused else "🗓 Next week is ready"
     text = coach.overview(result, f"{heading}. {coach.week_label(monday)}")
     text += "\n\nLeft shoulder: " + coach.trend()
     if not coach.store.load_checkin(sunday):
@@ -2542,7 +2570,7 @@ async def job_catch_up(context: ContextTypes.DEFAULT_TYPE) -> None:
     if today.weekday() <= 4 and not coach.store.load_plan(monday):
         await owner_send(context, "I was offline when this week's plan was due, so I am building it now.")
         try:
-            result = await coach.build_week(monday, kind="build", wait=True)
+            result = await coach.build_week(monday, kind="build", wait=True, keep_if=lambda meta: True)
         except ClaudeError as exc:
             await owner_send(context, f"I could not build this week's plan. {exc.user_message} Send /plan to try again.")
             return
@@ -2596,7 +2624,10 @@ def main() -> None:
     setup_logging(cfg)
     try:
         application = build_application(cfg)
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        application.run_polling(
+            allowed_updates=[Update.MESSAGE, Update.CALLBACK_QUERY],
+            bootstrap_retries=-1,  # keep retrying if Telegram is unreachable at start up
+        )
     except Exception:  # noqa: BLE001 - log through the redacting formatter, then let Docker restart us
         log.exception("The bot stopped because of an error. Docker will restart it.")
         raise SystemExit(1) from None
