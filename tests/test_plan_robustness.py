@@ -186,3 +186,28 @@ def test_torn_log_line_does_not_swallow_the_next(coach, clock):
     path.write_text('{"date": "2026-09-29", "time": "20:00", "text": "rows 20kg"}\n{"date": "2026-09-30", "te')
     coach.store.add_log(coach.now(), "squats 40kg")
     assert [r["text"] for r in coach.store.logs()] == ["rows 20kg", "squats 40kg"]
+
+
+@pytest.mark.parametrize(
+    "line,entry",
+    [
+        # shapes seen in a real Claude plan
+        ("6. Rehab: Band external rotation at the side: 2 x 15 each side, rest 30s", ("Band external rotation at the side", True)),
+        ("2. Single arm cable chest press, standing: 3 x 10 each side, rest 75s", ("Single arm cable chest press", False)),
+        ("5. Run: 20 to 25 min (about 4 km) on the treadmill or outside", ("Run", False)),
+        ("1. Warm up kick with board: 4 x 50 m, rest 20s", ("Warm up kick with board", False)),
+        ("3. Superset: goblet squat 3 x 10", ("goblet squat", False)),
+    ],
+)
+def test_exercise_entries(line, entry):
+    assert bot.exercise_entry(line) == entry
+
+
+async def test_rehab_moves_may_repeat_and_are_tagged(coach, claude):
+    plan = "\n".join(
+        f"📅 {d}: Push\n1. Cable row: 3 x 10\n2. Rehab: Band external rotation: 2 x 15" for d in bot.DAY_NAMES
+    )
+    coach.store.save_plan(date(2026, 9, 21), plan, {}, "x")
+    assert coach.previous_exercises(date(2026, 9, 28)) == ["Cable row"]
+    result = bot.PlanResult(date(2026, 9, 21), plan, {}, [])
+    assert "Cable row, Band external rotation (rehab)" in coach.overview(result, "x")
