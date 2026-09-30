@@ -129,12 +129,12 @@ def monday_of(day: date) -> date:
     return day - timedelta(days=day.weekday())
 
 
+# A * stands for up to two words, so "overhead * press" also catches "overhead DB press".
 DEFAULT_BLOCKED = (
-    "overhead press, shoulder press, military press, push press, arnold press, z press, "
-    "clean and press, behind the neck, upright row, dip, wide grip bench, barbell bench, "
-    "bench press, fly, flye, flies, pec deck, overhead tricep extension, "
-    "overhead triceps extension, overhead carry, overhead squat, snatch, jerk, thruster, "
-    "handstand, kipping"
+    "overhead * press, shoulder press, military * press, push press, arnold * press, z press, "
+    "clean and press, behind the neck, upright * row, dip, wide grip * bench, barbell * bench, "
+    "bench press, fly, flye, flies, pec deck, overhead * extension, overhead * carry, "
+    "overhead * squat, snatch, jerk, thruster, handstand, kipping"
 )
 DEFAULT_ALLOWED = (
     "reverse * fly, reverse * flye, reverse * flies, rear delt * fly, rear delt * flye, "
@@ -357,8 +357,13 @@ class Store:
 
     def _append_jsonl(self, name: str, row: dict) -> None:
         path = self.root / name
+        torn = False
+        if path.exists() and path.stat().st_size:
+            with path.open("rb") as fh:
+                fh.seek(-1, os.SEEK_END)
+                torn = fh.read(1) != b"\n"
         with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+            fh.write(("\n" if torn else "") + json.dumps(row, ensure_ascii=False) + "\n")
 
     # -- state --------------------------------------------------------------
 
@@ -478,20 +483,27 @@ class Store:
 # Weekly plan text: parsing and checks
 # ---------------------------------------------------------------------------
 
+YT_TAG_RE = re.compile(r"\[\s*yt\s*:\s*([^\]\n]+?)\s*\]", re.IGNORECASE)
+DAY_WORDS = (
+    "monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    "mon|tues|tue|wed|thurs|thur|thu|fri|sat|sun"
+)
 DAY_HEADER_RE = re.compile(
-    r"^[\s*_>#]*📅\s*[*_]*\s*(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b(.*)$",
+    r"^[\s*_>#•\-]*(?:📅|🗓)️?\s*[*_]*\s*(" + DAY_WORDS + r")\b(.*)$",
     re.IGNORECASE,
 )
-NOTES_RE = re.compile(r"^[\s*_>#]*📝")
-NUMBERED_RE = re.compile(r"^\s*[*_]*\s*(\d{1,2})\s*[.)]\s*(.+)$")
-BULLET_LINE_RE = re.compile(r"^\s*(?:[•\-*+–]\s+|[*_]*\s*\d{1,2}\s*[.)]\s*)(.+)$")
+NOTES_RE = re.compile(r"^[\s*_>#•\-]*📝")
+# "1. Row", "1) Row", "A1. Row", "1a. Row", "1️⃣ Row", "**1. Row**"
+NUMBERED_RE = re.compile(r"^\s*[*_]*\s*([A-Da-d]?\d{1,2}[a-d]?)(?:️?⃣|\s*[.)])\s*(.+)$")
 REST_RE = re.compile(r"\b(rest|off)\b", re.IGNORECASE)
 STRENGTH_DAY_RE = re.compile(
-    r"push|pull|leg|upper|lower|chest|back|arm|shoulder|full body|strength|gym", re.IGNORECASE
+    r"\b(push|pull|legs?|upper|lower|chest|back|arms?|shoulders?|full body|strength|gym)\b",
+    re.IGNORECASE,
 )
+NOT_GYM_DAY_RE = re.compile(r"\b(rest|off|basketball|game|swim\w*|mobility|recovery)\b", re.IGNORECASE)
 TRAINING_WORDS_RE = re.compile(
-    r"push|pull|leg|upper|lower|chest|back|arm|shoulder|full body|swim|run|conditioning|"
-    r"strength|core|gym|lift|power",
+    r"\b(push|pull|legs?|upper|lower|chest|back|arms?|shoulders?|full body|swim\w*|run\w*|"
+    r"conditioning|cardio|strength|core|gym|lift\w*|power|intervals?|plyo\w*|agility|jump\w*|hiit)\b",
     re.IGNORECASE,
 )
 
@@ -523,13 +535,19 @@ class ParsedPlan:
 
 
 def is_rest_focus(focus: str) -> bool:
+    if re.match(r"^\W*(rest|off)\b", focus, re.IGNORECASE):
+        return True  # "Rest day, off from the gym", "Rest, easy swim optional"
     return bool(REST_RE.search(focus)) and not TRAINING_WORDS_RE.search(focus)
 
 
 def _header_focus(rest: str) -> str:
+    """'(5 Oct): Push' or ', 5 Oct: Push' or ' - Push' -> 'Push'."""
     rest = rest.strip()
-    m = re.match(r"^[^:\-–—,]*?[:\-–—,]\s*(.*)$", rest)
-    focus = m.group(1) if m else rest
+    if ":" in rest:
+        focus = rest.split(":", 1)[1]
+    else:
+        m = re.match(r"^[^\-–—,]*?[\-–—,]\s*(.*)$", rest)
+        focus = m.group(1) if m else rest
     return focus.strip().strip("*_ ").strip()
 
 
@@ -547,8 +565,11 @@ def parse_plan(text: str) -> ParsedPlan:
     days: dict[int, PlanDay] = {}
     for k, (start, idx, focus) in enumerate(headers):
         end = headers[k + 1][0] if k + 1 < len(headers) else (notes_start or len(lines))
-        if idx not in days:
-            days[idx] = PlanDay(idx, focus, "\n".join(lines[start:end]).strip())
+        block = "\n".join(lines[start:end]).strip()
+        if idx in days:  # a second header for the same day, e.g. Friday's legs option
+            days[idx].text += "\n\n" + block
+        else:
+            days[idx] = PlanDay(idx, focus, block)
     preface = "\n".join(lines[: headers[0][0]]).strip()
     notes = "\n".join(lines[notes_start:]).strip() if notes_start is not None else ""
     return ParsedPlan(preface=preface, days=days, notes=notes)
@@ -576,36 +597,49 @@ def plan_exercises(text: str) -> list[tuple[int, str]]:
     return out
 
 
+# Words that introduce a movement the line is NOT doing: "Landmine press, swap for overhead
+# press" or "Push ups (not dips)". Only the phrase up to the next punctuation is removed.
 NEGATION_RE = re.compile(
-    r"\b(instead of|in place of|replac\w*|swap\w*|rather than|avoid\w*|skip\w*|not|no|without)\b.*$",
+    r"\b(?:instead of|in place of|rather than|replac(?:es|ing|ement for)|(?:a )?swap(?:ped)? for|"
+    r"alternative to|not|no|avoid(?:ing)?|skip(?:ping)?|without)\b[^,.;:()\n]*",
     re.IGNORECASE,
 )
+# In the allowed list a * may stand for up to two words, but never for words that start
+# a second exercise ("dumbbell pullover and barbell bench press").
+ALLOWED_GAP = r"(?:(?!(?:and|or|then|plus|with|barbell|bar|superset)\b)[\w'-]+\s+){0,2}?"
+BLOCKED_GAP = r"(?:[\w'-]+\s+){0,2}?"
+SKIP_LINE_RE = re.compile(r"^[\s*_•\-]*(?:video|cue)\s*:", re.IGNORECASE)
 
 
-def _term_regex(term: str) -> re.Pattern:
+def _term_regex(term: str, gap: str = BLOCKED_GAP) -> re.Pattern:
     parts = []
     for word in term.lower().split():
-        parts.append(r"(?:[\w'-]+\s+){0,3}?" if word == "*" else re.escape(word) + r"[\s-]*")
+        if word == "*":
+            parts.append(gap)
+        else:  # each word may be plural: dip/dips, tricep/triceps, fly/flyes
+            parts.append(re.escape(word) + r"(?:e?s)?\b[\s-]*")
     body = "".join(parts)
     body = body[: -len(r"[\s-]*")] if body.endswith(r"[\s-]*") else body
-    return re.compile(r"\b" + body + r"(?:e?s)?\b", re.IGNORECASE)
+    return re.compile(r"\b" + body, re.IGNORECASE)
 
 
 def find_blocked(text: str, blocked: list[str], allowed: list[str]) -> list[dict]:
-    """Exercise lines that contain a movement the injury rules leave out."""
+    """Lines inside a day that contain a movement the injury rules leave out.
+
+    Every line of a day is checked (exercises, warm ups, finishers, options), except the
+    header and the Cue and Video lines. Video tags, brackets and negated phrases are removed
+    first, then allowed movements, then the rest is searched for blocked movements.
+    """
     blocked_res = [(term, _term_regex(term)) for term in blocked]
-    allowed_res = [_term_regex(term) for term in allowed]
+    allowed_res = [_term_regex(term, ALLOWED_GAP) for term in allowed]
     hits = []
     for day in parse_plan(text).days.values():
-        for line in day.text.splitlines()[1:]:
-            m = BULLET_LINE_RE.match(line)
-            if not m:
+        for line in day.text.splitlines():
+            if not line.strip() or DAY_HEADER_RE.match(line) or SKIP_LINE_RE.match(line):
                 continue
-            content = m.group(1)
-            if re.match(r"[*_\s]*(video|cue)\s*:", content, re.IGNORECASE) or "[yt:" in content.lower():
-                continue
-            check = re.sub(r"\([^)]*\)", " ", content)
-            check = NEGATION_RE.sub("", check)
+            check = YT_TAG_RE.sub(" ", line)
+            check = re.sub(r"\([^)]*\)", " ", check).replace("**", " ").replace("__", " ")
+            check = NEGATION_RE.sub(" ", check)
             for pattern in allowed_res:
                 check = pattern.sub(" ", check)
             for term, pattern in blocked_res:
@@ -696,7 +730,6 @@ def shoulder_rising(ratings: list[dict], today: date) -> bool:
 # Telegram formatting
 # ---------------------------------------------------------------------------
 
-YT_TAG_RE = re.compile(r"\[\s*yt\s*:\s*([^\]\n]+?)\s*\]", re.IGNORECASE)
 MD_LINK_RE = re.compile(r"\[([^\]\n]+)\]\((https?://[^\s)]+)\)")
 BOLD_RE = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*")
 CODE_RE = re.compile(r"`([^`\n]+)`")
@@ -734,6 +767,7 @@ def to_html(text: str) -> str:
             keep.append(snippet)
             return f"\x00{len(keep) - 1}\x00"
 
+        line = CODE_RE.sub(lambda m: stash(f"<code>{html.escape(m.group(1), quote=False)}</code>"), line)
         line = YT_TAG_RE.sub(
             lambda m: stash(
                 f'<a href="{html.escape(yt_search_url(m.group(1)))}">'
@@ -749,7 +783,6 @@ def to_html(text: str) -> str:
         )
         line = html.escape(line, quote=False)
         line = BOLD_RE.sub(r"<b>\1</b>", line)
-        line = CODE_RE.sub(r"<code>\1</code>", line)
         line = re.sub("\x00(\\d+)\x00", lambda m: keep[int(m.group(1))], line)
         out.append(line)
     return "\n".join(out).strip()
@@ -1584,7 +1617,7 @@ class Coach:
                 + "."
             )
         for day in parsed.days.values():
-            if STRENGTH_DAY_RE.search(day.focus) and not any(
+            if STRENGTH_DAY_RE.search(day.focus) and not NOT_GYM_DAY_RE.search(day.focus) and not any(
                 exercise_name(line) for line in day.text.splitlines()[1:]
             ):
                 problems.append(
@@ -1593,7 +1626,7 @@ class Coach:
                 )
         for hit in find_blocked(text, self.cfg.blocked_movements, self.cfg.allowed_movements):
             problems.append(
-                f"{hit['day']}, \"{hit['line']}\": {hit['term']} is a movement my injury rules "
+                f"{hit['day']}, \"{hit['line']}\": {hit['term'].replace(' * ', ' ')} is a movement my injury rules "
                 "leave out."
             )
         return problems
@@ -1677,10 +1710,15 @@ class Coach:
         if problems:
             log.info("Plan for %s has %d problems, asking Claude to fix it once", monday, len(problems))
             try:
-                text = clean_reply(
+                candidate = clean_reply(
                     await self.runner.run(system, self.fix_request(text, problems, had_split), "plan")
                 )
-                fixed = True
+                if len(parse_plan(candidate).missing_days) <= len(parse_plan(text).missing_days) and len(
+                    self.plan_problems(candidate)
+                ) <= len(problems):
+                    text, fixed = candidate, True
+                else:
+                    warnings.append("Claude's fixed version was worse, so I kept the first version.")
             except ClaudeError as exc:
                 warnings.append(f"I could not get the plan fixed ({exc.user_message}).")
             problems = self.plan_problems(text)
@@ -1731,10 +1769,13 @@ class Coach:
             return await self.generate_plan(monday, request, kind=kind, save_split=save_split, notes=notes)
 
     async def adjust_after_skip(self, day: date) -> PlanResult | None:
-        """Rewrite the rest of the week after a skipped session, without doubling up."""
+        """Rewrite the rest of the week after a skipped session, without doubling up.
+
+        Days up to today stay as they are, even when an old Skipped button is tapped late."""
         monday = monday_of(day)
         wd = day.weekday()
-        if wd >= 6:
+        upto = max(day, self.today()).weekday() if monday_of(self.today()) == monday else wd
+        if upto >= 6:
             return None
         async with self.plan_lock:
             plan = self.store.load_plan(monday)
@@ -1742,11 +1783,12 @@ class Coach:
                 return None
             today_plan = parse_plan(plan).days.get(wd)
             focus = today_plan.focus if today_plan else "today's session"
-            kept = "Monday" if wd == 0 else f"Monday to {DAY_NAMES[wd]}"
+            kept = "Monday" if upto == 0 else f"Monday to {DAY_NAMES[upto]}"
+            which = "today's session" if upto == wd else f"{DAY_NAMES[wd]}'s session"
             request = "\n".join(
                 [
-                    f"I skipped today's session ({DAY_NAMES[wd]}: {focus}).",
-                    f"Adjust the rest of this week, {DAY_NAMES[wd + 1]} to Sunday, following your "
+                    f"I skipped {which} ({DAY_NAMES[wd]}: {focus}).",
+                    f"Adjust the rest of this week, {DAY_NAMES[upto + 1]} to Sunday, following your "
                     "rules: do not double up, keep what matters most, and keep my shoulder safe.",
                     f"Keep {kept} exactly as written, but add (skipped) at the end of the "
                     f"{DAY_NAMES[wd]} line.",
@@ -2081,9 +2123,9 @@ async def cmd_shoulder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     coach = coach_of(context)
     arg = args_text(update)
     if arg:
-        m = re.fullmatch(r"(\d{1,2})(?:\s*/\s*10)?\s*(.*)", arg, re.DOTALL)
+        m = re.fullmatch(r"(\d{1,2})(?![\d.,])(?:\s*/\s*10)?\s*(.*)", arg, re.DOTALL)
         if not m or int(m.group(1)) > 10:
-            await reply(update, context, "Send /shoulder on its own for your log, or /shoulder 3 to save a rating from 0 to 10.")
+            await reply(update, context, "Send /shoulder on its own for your log, or /shoulder 3 to save a rating. Use a whole number from 0 to 10.")
             return
         now = coach.now()
         rating = int(m.group(1))
@@ -2124,17 +2166,18 @@ async def on_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = query.message.chat.id
     now = coach.now()
     previous = coach.store.sessions().get(day.isoformat(), {}).get("status")
+    # Save before the first await, so a double tap sees the first tap's answer.
+    coach.store.set_session(day, "done" if answer == "done" else "skipped", now, "button")
     await query.answer()
     if answer == "done":
-        coach.store.set_session(day, "done", now, "button")
         with contextlib.suppress(BadRequest):
             await query.edit_message_text(f"✅ {fmt_day(day)} marked as done. Nice work.")
         await send_text(context.bot, chat_id, RATING_QUESTION, reply_markup=rating_keyboard(day))
         return
-    coach.store.set_session(day, "skipped", now, "button")
     with contextlib.suppress(BadRequest):
         await query.edit_message_text(f"⏭ {fmt_day(day)} marked as skipped.")
-    if previous == "skipped" or monday_of(day) != monday_of(coach.today()) or day.weekday() >= 6:
+    today = coach.today()
+    if previous == "skipped" or monday_of(day) != monday_of(today) or max(day, today).weekday() >= 6:
         return
     if not coach.store.load_plan(monday_of(day)):
         return
@@ -2146,7 +2189,7 @@ async def on_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await send_text(context.bot, chat_id, f"I saved the skip but could not adjust the plan. {exc.user_message}")
         return
     if result:
-        await send_text(context.bot, chat_id, coach.rest_of_week(result, day))
+        await send_text(context.bot, chat_id, coach.rest_of_week(result, max(day, today)))
 
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2450,6 +2493,8 @@ async def job_session_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
         if not coach.program_start():
             await owner_send(context, "No training plan yet. Send /plan to build your first week.")
             return
+        if coach.program_start() > monday:
+            return  # the programme starts next week (first plan built with /nextweek)
         try:
             await coach.build_week(monday, kind="build", wait=True, keep_if=lambda meta: True)
         except ClaudeError as exc:
@@ -2522,8 +2567,9 @@ async def build_next_week(context: ContextTypes.DEFAULT_TYPE, monday: date) -> N
     def keep(meta: dict) -> bool:  # a plan built after the check in answer is kept
         return answered_at is None or meta.get("built_at", "") >= answered_at
 
+    notes = coach.store.load_plan_meta(monday).get("notes", "")  # e.g. from /nextweek on Saturday
     try:
-        result = await coach.build_week(monday, kind="scheduled", wait=True, keep_if=keep)
+        result = await coach.build_week(monday, notes, kind="scheduled", wait=True, keep_if=keep)
     except ClaudeError as exc:
         await owner_send(context, f"I could not build next week's plan. {exc.user_message} Send /nextweek to try again.")
         return
@@ -2567,7 +2613,8 @@ async def job_catch_up(context: ContextTypes.DEFAULT_TYPE) -> None:
             await owner_send(context, "I was offline at plan time, so I am building next week's plan now.")
             await build_next_week(context, monday + timedelta(days=7))
             return
-    if today.weekday() <= 4 and not coach.store.load_plan(monday):
+    start = coach.program_start()
+    if today.weekday() <= 4 and not coach.store.load_plan(monday) and start and start <= monday:
         await owner_send(context, "I was offline when this week's plan was due, so I am building it now.")
         try:
             result = await coach.build_week(monday, kind="build", wait=True, keep_if=lambda meta: True)

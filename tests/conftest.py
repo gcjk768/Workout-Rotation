@@ -5,6 +5,7 @@ Nothing here needs a real bot token, Claude token or network access.
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import json
 import os
@@ -35,6 +36,7 @@ class FakeTelegram(BaseRequest):
         self.calls: list[tuple[str, dict]] = []
         self.reject_html = False
         self.blocked_chats: set[int] = set()  # chats where Telegram answers 403
+        self.delay = 0.0  # seconds of fake network latency per call
         self._ids = itertools.count(1000)
 
     @property
@@ -51,6 +53,8 @@ class FakeTelegram(BaseRequest):
                          connect_timeout=None, pool_timeout=None):
         api = url.rsplit("/", 1)[-1]
         params = dict(request_data.parameters) if request_data else {}
+        if self.delay:
+            await asyncio.sleep(self.delay)
         self.calls.append((api, params))
         if api == "getMe":
             result = {"id": 42, "is_bot": True, "first_name": "Coach", "username": "coach_test_bot",

@@ -35,7 +35,7 @@ def test_config_reads_bot_env(cfg):
     assert cfg.plan_time.strftime("%H:%M") == "20:00"
     assert cfg.token_created == date(2026, 1, 15)
     assert cfg.basketball_days == []
-    assert "overhead press" in cfg.blocked_movements
+    assert "overhead * press" in cfg.blocked_movements
 
 
 def test_config_parsing_helpers():
@@ -238,11 +238,11 @@ def test_injury_check_ignores_swaps_and_allowed_moves(cfg):
 @pytest.mark.parametrize(
     "line,term",
     [
-        ("1. Barbell overhead press: 3 x 8", "overhead press"),
+        ("1. Barbell overhead press: 3 x 8", "overhead * press"),
         ("2. Bench dips: 3 x 12", "dip"),
-        ("**3. Upright rows** 3x10", "upright row"),
+        ("**3. Upright rows** 3x10", "upright * row"),
         ("• Behind the neck pulldown: 3 x 10", "behind the neck"),
-        ("4. Wide grip bench press: 5 x 5", "wide grip bench"),
+        ("4. Wide grip bench press: 5 x 5", "wide grip * bench"),
         ("5. Cable chest flyes: 3 x 12", "fly"),
         ("6. Seated dumbbell shoulder press: 3 x 10", "shoulder press"),
     ],
