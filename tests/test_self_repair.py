@@ -319,3 +319,30 @@ async def test_what_i_did_for_a_code_bug(app, claude, clock):
     assert done == "Nothing. I can't fix this on my own; it needs the code change below."
     done, _ = await repair.apply({"remedy": "none", "code_fix": ""}, None)
     assert done == "Nothing. It looks like a one off, so there is nothing to fix."
+
+
+async def test_repair_alerts_are_mirrored_to_the_alert_chat(env, clock, claude):
+    tg = FakeTelegram()
+    cfg = bot.Config.from_env({**env, "REPAIR_ALERT_CHAT": "-1002069000031/2930"})
+    app = bot.build_application(cfg, request=tg, concurrent=False)
+    await app.initialize()
+    try:
+        claude.enqueue(remedy(diagnosis="A bug.", code_fix="Guard it."))
+        await bot.on_error(None, ctx(app, failing()))
+        mirror = [p for p in tg.sent() if int(p["chat_id"]) == -1002069000031]
+        assert len(mirror) == 1 and int(mirror[0]["message_thread_id"]) == 2930
+        assert mirror[0]["text"].startswith("<b>gym-coach-bot</b>\n🩺 <b>Self repair</b>")
+        assert "<b>What Claude found:</b> A bug." in mirror[0]["text"] and "Guard it." in mirror[0]["text"]
+        assert check_message({"text": mirror[0]["text"], "parse_mode": "HTML"}) is None
+        assert any(int(p["chat_id"]) == OWNER and "Self repair" in p["text"] for p in tg.sent())
+        tg.blocked_chats.add(-1002069000031)  # a failed mirror must not break anything
+        claude.enqueue(remedy(diagnosis="Another."))
+        await bot.on_error(None, ctx(app, ValueError("other")))
+    finally:
+        await app.shutdown()
+
+
+def test_repair_alert_chat_must_be_chat_slash_topic(env):
+    with pytest.raises(bot.ConfigError):
+        bot.Config.from_env({**env, "REPAIR_ALERT_CHAT": "not a chat"})
+    assert bot.Config.from_env(env).repair_alert_chat is None

@@ -245,6 +245,18 @@ def public_holiday(country: str, day: date) -> str | None:
     return _holiday_calendar(country.upper(), day.year).get(day)
 
 
+def parse_chat(value: str | None) -> tuple[int, int | None] | None:
+    """'-1002069000031/2930' (or ':2930') is a group topic; a bare ID is a whole chat."""
+    value = _clean(value)
+    if not value:
+        return None
+    chat, _, topic = value.replace(":", "/").partition("/")
+    try:
+        return int(chat), int(topic) if topic else None
+    except ValueError as exc:
+        raise ConfigError("REPAIR_ALERT_CHAT must look like -1002069000031/2930") from exc
+
+
 def monday_of(day: date) -> date:
     return day - timedelta(days=day.weekday())
 
@@ -315,6 +327,7 @@ class Config:
     safety_review: bool = True
     structured_plans: bool = True
     self_repair: bool = True
+    repair_alert_chat: tuple[int, int | None] | None = None  # (chat, topic) that also gets 🩺 alerts
     claude_retry_delay: float = 5.0
     ask_timeout: int = 240
     plan_timeout: int = 600
@@ -400,6 +413,7 @@ class Config:
             safety_review=parse_switch(env.get("SAFETY_REVIEW"), True),
             structured_plans=parse_switch(env.get("STRUCTURED_PLANS"), True),
             self_repair=parse_switch(env.get("SELF_REPAIR"), True),
+            repair_alert_chat=parse_chat(env.get("REPAIR_ALERT_CHAT")),
             claude_retry_delay=float(get("CLAUDE_RETRY_DELAY", "5")),
             secrets=[
                 v
@@ -3885,7 +3899,7 @@ class SelfRepair:
         head = f"🩺 **Self repair**\nSomething went wrong in {where} ({type(error).__name__})."
         if not self.coach.cfg.self_repair:
             self.record(now, where, sig, "none", "")
-            await owner_send(self.ctx, f"{head}\nThe details are saved in data/errors.jsonl.")
+            await self.notify(f"{head}\nThe details are saved in data/errors.jsonl.")
             return
         try:
             result = await self.diagnose(error, where)
@@ -3898,7 +3912,7 @@ class SelfRepair:
                 reason = f"that failed too ({type(exc).__name__})."
                 log.exception("The self repair diagnosis failed")
             self.record(now, where, sig, "none", "")
-            await owner_send(self.ctx, f"{head}\nI could not ask Claude to look at it: {reason} "
+            await self.notify(f"{head}\nI could not ask Claude to look at it: {reason} "
                                        "The details are saved in data/errors.jsonl.")
             return
         done, restart = await self.apply(result, job)
@@ -3910,12 +3924,25 @@ class SelfRepair:
         if result.get("code_fix", "").strip():  # for a programmer, so it stays folded
             blocks.append("<b>🛠 Suggested code change</b> <i>for the next update, tap to open</i>\n"
                           f"<blockquote expandable>{_h(result['code_fix'].strip()[:1500])}</blockquote>")
-        await owner_send(self.ctx, blocks)
+        await self.notify(blocks)
         if restart:
             global RESTART_REQUESTED
             RESTART_REQUESTED = True
             note_exit(self.store, f"self repair: {result.get('diagnosis', '')[:150]}")
             self.restart()
+
+    async def notify(self, view: str | list[str]) -> None:
+        """Tell the owner, and copy it to REPAIR_ALERT_CHAT (the NAS Doctor topic) when set."""
+        await owner_send(self.ctx, view)
+        target = self.coach.cfg.repair_alert_chat
+        if target is None:
+            return
+        body = "\n\n".join(view) if isinstance(view, list) else to_html(view)
+        try:
+            await self.ctx.bot.send_message(target[0], f"<b>gym-coach-bot</b>\n{body}"[:4096],
+                                            parse_mode=ParseMode.HTML, message_thread_id=target[1])
+        except Exception as exc:  # noqa: BLE001 - the owner already has it
+            log.warning("Could not copy the self repair alert to REPAIR_ALERT_CHAT: %s", exc)
 
     def record(self, now: datetime, where: str, sig: str, remedy: str, diagnosis: str) -> None:
         health = self.health()
