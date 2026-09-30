@@ -936,6 +936,8 @@ SPARK = "▁▂▃▄▅▆▇█"
 def weekly_sparkline(ratings: list[dict], today: date, weeks: int = 8) -> str | None:
     """Weekly average shoulder rating as a tiny bar chart, oldest week first (· = no rating)."""
     this_monday = monday_of(today)
+    if not any((d := _row_date(r)) and d >= this_monday for r in ratings):
+        this_monday -= timedelta(days=7)  # early in the week: end the chart at last week
     bars, values = [], []
     for k in range(weeks - 1, -1, -1):
         start = this_monday - timedelta(weeks=k)
