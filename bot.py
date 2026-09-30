@@ -2531,8 +2531,12 @@ def main() -> None:
     except ConfigError as exc:
         raise SystemExit(f"Settings problem in bot.env: {exc}") from None
     setup_logging(cfg)
-    application = build_application(cfg)
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        application = build_application(cfg)
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    except Exception:  # noqa: BLE001 - log through the redacting formatter, then let Docker restart us
+        log.exception("The bot stopped because of an error. Docker will restart it.")
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":
