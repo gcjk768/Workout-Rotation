@@ -1,6 +1,10 @@
 services:
   gym-coach:
-    build: .
+    build:
+      context: .
+      args:
+        # Optional: pin Claude Code, e.g. sudo CLAUDE_CODE_VERSION=2.1.285 docker compose up -d --build
+        CLAUDE_CODE_VERSION: ${CLAUDE_CODE_VERSION:-}
     image: gym-coach-bot:local
     container_name: gym-coach-bot
     restart: unless-stopped

@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: Tests (fake Claude, fake Telegram, sample Garmin data)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt pytest pytest-asyncio
+      - run: python -m pytest -q
+
+  docker:
+    name: Docker image (real Dockerfile and Claude Code installer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image
+        run: docker build -t gym-coach-bot:ci .
+
+      - name: Claude Code is installed and runs as the coach user
+        run: docker run --rm gym-coach-bot:ci sh -c 'id && claude --version'
+
+      - name: Tests inside the image
+        run: >
+          docker run --rm -v "$PWD":/src:ro gym-coach-bot:ci sh -c
+          'cp -r /src /tmp/app && cd /tmp/app && pip install -q pytest pytest-asyncio && python -m pytest -q -p no:cacheprovider'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: End to end against the running container
+        run: |
+          mkdir -p data garmin
+          python tests/sample_garmin.py garmin/monitor.db "$(TZ=Asia/Singapore date +%F)"
+          cat > bot.env <<'EOF'
+          TELEGRAM_BOT_TOKEN=123456789:AAE2eFakeTokenForEndToEndTests_abcdefgh
+          ALLOWED_USER_IDS=111111
+          CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-CIFAKECIFAKECIFAKE
+          CLAUDE_TOKEN_CREATED=2026-01-15
+          TELEGRAM_BASE_URL=http://127.0.0.1:8090
+          CLAUDE_BIN=/fake/claude
+          EOF
+          python tests/e2e_scenario.py --serve 8090 > scenario.log 2>&1 &
+          docker run -d --name coach --network host --env-file bot.env \
+            -v "$PWD/data:/data" -v "$PWD/garmin:/garmin:ro" \
+            -v "$PWD/tests/bin/claude:/fake/claude:ro" gym-coach-bot:ci
+          for i in $(seq 1 90); do
+            grep -q "ALL CHECKS PASSED" scenario.log && break
+            grep -q "Traceback\|AssertionError" scenario.log && break
+            sleep 2
+          done
+          cat scenario.log
+          docker logs coach 2>&1 | tail -20
+          grep -q "ALL CHECKS PASSED" scenario.log
+          docker exec coach python /app/bot.py --health
+          test "$(stat -c %u data/state.json)" = "1000"
+          if docker logs coach 2>&1 | grep -q "AAE2eFakeToken\|CIFAKE"; then echo "token in logs"; exit 1; fi
+          docker stop coach
