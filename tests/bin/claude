@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""Fake `claude` CLI for tests. Never talks to the network.
+
+Records every call to $FAKE_CLAUDE_LOG (JSON lines). Behaviour per call comes from the
+first entry of $FAKE_CLAUDE_QUEUE (a JSON list file, entries are popped) or from
+$FAKE_CLAUDE_MODE. Modes: ok, error, auth, limit, maxturns, nonjson, sleep, list.
+"""
+import json
+import os
+import re
+import sys
+import time
+
+argv = sys.argv[1:]
+
+if argv[:1] == ["--version"]:
+    print("2.1.999 (Claude Code)")
+    sys.exit(0)
+
+if argv[:2] == ["auth", "status"]:
+    if os.environ.get("FAKE_CLAUDE_AUTH") == "out":
+        print(json.dumps({"loggedIn": False}))
+        sys.exit(1)
+    print(json.dumps({"loggedIn": True, "authMethod": "oauth_token", "apiProvider": "firstParty"}))
+    sys.exit(0)
+
+
+def flag(name):
+    if name in argv:
+        i = argv.index(name)
+        return argv[i + 1] if i + 1 < len(argv) else None
+    return None
+
+
+stdin = sys.stdin.read()
+prompt_file = flag("--system-prompt-file")
+system = open(prompt_file, encoding="utf-8").read() if prompt_file else ""
+plan_mode = flag("--tools") == ""
+
+entry = {}
+queue_path = os.environ.get("FAKE_CLAUDE_QUEUE")
+if queue_path and os.path.exists(queue_path):
+    with open(queue_path, encoding="utf-8") as fh:
+        queue = json.load(fh)
+    if queue:
+        entry = queue.pop(0)
+        with open(queue_path, "w", encoding="utf-8") as fh:
+            json.dump(queue, fh)
+mode = entry.get("mode") or os.environ.get("FAKE_CLAUDE_MODE", "ok")
+
+log_path = os.environ.get("FAKE_CLAUDE_LOG")
+if log_path:
+    with open(log_path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "argv": argv,
+            "stdin": stdin,
+            "system": system,
+            "cwd": os.getcwd(),
+            "cwd_files": os.listdir(os.getcwd()),
+            "prompt_file": prompt_file,
+            "env": {
+                "oauth": bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")),
+                "api_key": bool(os.environ.get("ANTHROPIC_API_KEY")),
+                "telegram": bool(os.environ.get("TELEGRAM_BOT_TOKEN")),
+                "autoupdater_off": os.environ.get("DISABLE_AUTOUPDATER") == "1",
+            },
+            "mode": mode,
+        }) + "\n")
+
+DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+DEFAULT_SPLIT = {
+    "Monday": "Push",
+    "Tuesday": "Pull",
+    "Wednesday": "Legs and core",
+    "Thursday": "Upper body and rehab",
+    "Friday": "Legs and run, or swim",
+    "Saturday": "Rest or light mobility",
+    "Sunday": "Rest",
+}
+
+
+def make_plan(text):
+    week = re.search(r"Week number: (\d+)", text)
+    week = int(week.group(1)) if week else 0
+    equip = re.search(r"Main equipment this week: ([^.\n]+)", text)
+    equip = equip.group(1).strip() if equip else "mixed"
+    split = dict(DEFAULT_SPLIT)
+    for day in DAYS:
+        m = re.search(rf"^{day}: (.+)$", text, re.M)
+        if m and "Keep my split" in text:
+            split[day] = m.group(1).strip()
+    skipped = re.search(r"I skipped today's session \((\w+)day", text)
+    lines = []
+    if "first week" in text:
+        lines += ["Push/pull suits your shoulder and basketball best, so I picked it.", ""]
+    for d, day in enumerate(DAYS):
+        focus = split[day]
+        if skipped and day.startswith(skipped.group(1)):
+            focus += " (skipped)"
+        lines.append(f"📅 {day}: {focus}")
+        if focus.startswith("Rest"):
+            lines += ["Rest day. Walk and stretch.", ""]
+            continue
+        lines.append("Warm up: 5 minutes easy bike, band pull aparts.")
+        for k in range(1, 3):
+            name = f"{equip.title()} move W{week} D{d + 1} N{k}"
+            lines += [f"{k}. {name}: 3 x 10, rest 90s", "Cue: slow and controlled.", f"Video: [yt: {name} proper form]"]
+        lines += ["3. Band external rotation: 2 x 15, rest 30s", "Cue: elbow tucked.", "Video: [yt: band external rotation proper form]"]
+        lines += ["Cool down: 5 minutes stretching.", ""]
+    lines.append("📝 Notes: sleep 7 hours, protein about 125 g a day. Confirm the rehab block with your physio.")
+    if "Your plan below has problems" in text:
+        lines.append("FIXED")
+    if skipped:
+        lines.append("ADJUSTED")
+    return "\n".join(lines)
+
+
+def emit(obj, code=0):
+    print(json.dumps(obj))
+    sys.exit(code)
+
+
+if mode == "sleep":
+    time.sleep(float(entry.get("seconds") or os.environ.get("FAKE_CLAUDE_SLEEP", "5")))
+    mode = "ok"
+if mode == "nonjson":
+    print("Error: something went wrong before JSON")
+    sys.exit(1)
+if mode == "error":
+    emit({"type": "result", "subtype": "success", "is_error": True, "result": "API Error: 500 Internal server error"}, 1)
+if mode == "auth":
+    emit({"type": "result", "subtype": "success", "is_error": True, "result": "Invalid API key · Please run /login"}, 1)
+if mode == "limit":
+    emit({"type": "result", "subtype": "success", "is_error": True, "result": "Claude AI usage limit reached|1760000000"}, 1)
+if mode == "maxturns":
+    emit({"type": "result", "subtype": "error_max_turns", "is_error": False, "num_turns": 11})
+
+if "result" in entry:
+    result = entry["result"]
+elif plan_mode:
+    result = make_plan(stdin)
+else:
+    last = stdin.strip().splitlines()[-1] if stdin.strip() else ""
+    result = (
+        "**Coach says:** keep it light today.\n"
+        "- Goblet squat 3 x 10\n"
+        "- Video: [yt: goblet squat proper form]\n"
+        f"You asked: {last}"
+    )
+payload = {"type": "result", "subtype": "success", "is_error": False, "result": result,
+           "num_turns": 1, "total_cost_usd": 0.01, "session_id": "fake"}
+if mode == "list":
+    print(json.dumps([{"type": "system"}, payload]))
+    sys.exit(0)
+emit(payload)
