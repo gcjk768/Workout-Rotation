@@ -29,14 +29,14 @@ A private Telegram bot that coaches you like a personal trainer. It runs in Dock
    - `CLAUDE_CODE_OAUTH_TOKEN`
    - `CLAUDE_TOKEN_CREATED`, the date from step 1
 
-   Leave `ALLOWED_USER_IDS` empty for now. Check the other settings too: about you, reminder times and basketball days.
+   Leave `ALLOWED_USER_IDS` empty for now. Check the other settings too: about you, reminder times and basketball days. Don't put ` #` or `$` inside a value, because Docker reads them specially. Then run `chmod 600 bot.env`, since the file holds your tokens.
 5. **Check the Garmin path.** `compose.yaml` mounts `/volume1/docker/garmin-monitor/data` read-only. Change that line if garmin-monitor lives somewhere else. In `bot.env`, `GARMIN_PROFILE` must match the profile name in garmin-monitor's `config.yaml` (default `Me`).
 6. **Start it.** Enable SSH in UGOS (Control Panel → Terminal), connect, and run:
    ```sh
    cd /volume1/docker/gym-coach
    sudo docker compose up -d --build
    ```
-7. **Send `/whoami` to your bot.** Until your ID is allowed, it replies with your Telegram user ID.
+7. **Send `/whoami` to your bot in a private chat.** Until your ID is allowed, it replies with your Telegram user ID. The bot only works in private chats. To stop it from being added to groups, send `/setjoingroups` to @BotFather and choose Disable.
 8. **Add your ID** to `ALLOWED_USER_IDS` in `bot.env`, then run `sudo docker compose up -d` again to apply the change. A plain `restart` does not reload `bot.env`. The first ID in the list gets the reminders.
 9. **Send `/plan`.** The first plan takes a minute or two. The week you send it becomes week 1.
 

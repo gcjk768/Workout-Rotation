@@ -34,6 +34,7 @@ class FakeTelegram(BaseRequest):
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
         self.reject_html = False
+        self.blocked_chats: set[int] = set()  # chats where Telegram answers 403
         self._ids = itertools.count(1000)
 
     @property
@@ -56,6 +57,9 @@ class FakeTelegram(BaseRequest):
                       "can_join_groups": True, "can_read_all_group_messages": False,
                       "supports_inline_queries": False}
         elif api in ("sendMessage", "editMessageText"):
+            if int(params.get("chat_id", 0)) in self.blocked_chats:
+                return 403, json.dumps({"ok": False, "error_code": 403,
+                                        "description": "Forbidden: bot was blocked by the user"}).encode()
             if self.reject_html and params.get("parse_mode") == "HTML":
                 return 400, json.dumps({"ok": False, "error_code": 400,
                                         "description": "Bad Request: can't parse entities"}).encode()
@@ -208,6 +212,14 @@ def message_update(app, text: str, user_id: int = OWNER, chat_id: int | None = N
             "text": "earlier bot message",
         }
     return Update.de_json({"update_id": next(_update_ids), "message": message}, app.bot)
+
+
+def edited_update(app, text: str, user_id: int = OWNER) -> Update:
+    data = message_update(app, text, user_id=user_id).to_dict()
+    msg = data.pop("message")
+    msg["edit_date"] = msg["date"] + 5
+    data["edited_message"] = msg
+    return Update.de_json(data, app.bot)
 
 
 def callback_update(app, data: str, user_id: int = OWNER, message_id: int = 5000) -> Update:
