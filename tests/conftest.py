@@ -60,6 +60,10 @@ class FakeTelegram(BaseRequest):
             result = {"id": 42, "is_bot": True, "first_name": "Coach", "username": "coach_test_bot",
                       "can_join_groups": True, "can_read_all_group_messages": False,
                       "supports_inline_queries": False}
+        elif api == "sendDocument":
+            result = {"message_id": next(self._ids), "date": 1759200000,
+                      "chat": {"id": int(params.get("chat_id", OWNER)), "type": "private"},
+                      "document": {"file_id": "f1", "file_unique_id": "u1", "file_name": "file.csv"}}
         elif api in ("sendMessage", "editMessageText"):
             if int(params.get("chat_id", 0)) in self.blocked_chats:
                 return 403, json.dumps({"ok": False, "error_code": 403,
@@ -119,6 +123,8 @@ def base_env(tmp_path: Path) -> dict[str, str]:
         "SESSION_MINUTES": "60",
         "INJURY_NOTES": "Left shoulder micro tear. Not cleared for heavy loading.",
         "BASKETBALL_DAYS": "",
+        "CLAUDE_RETRY_DELAY": "0",
+        "SAFETY_REVIEW": "off",  # tests that need it turn it on
     }
 
 
@@ -161,7 +167,14 @@ class ClaudeCalls:
         return self.all()[-1]
 
     def plan_calls(self) -> list[dict]:
-        return [c for c in self.all() if "--tools" in c["argv"] and c["argv"][c["argv"].index("--tools") + 1] == ""]
+        return [
+            c for c in self.all()
+            if "--tools" in c["argv"] and c["argv"][c["argv"].index("--tools") + 1] == ""
+            and not c["stdin"].startswith("SAFETY REVIEW")
+        ]
+
+    def review_calls(self) -> list[dict]:
+        return [c for c in self.all() if c["stdin"].startswith("SAFETY REVIEW")]
 
     def enqueue(self, *entries: dict) -> None:
         existing = json.loads(self.queue.read_text()) if self.queue.exists() else []

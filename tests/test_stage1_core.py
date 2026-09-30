@@ -355,7 +355,7 @@ async def test_api_key_is_used_when_there_is_no_oauth_token(env, clock, claude, 
     ],
 )
 async def test_claude_failures_become_plain_messages(coach, claude, mode, expected):
-    claude.enqueue({"mode": mode})
+    claude.enqueue({"mode": mode}, {"mode": mode})  # brief errors are retried once
     with pytest.raises(bot.ClaudeError) as err:
         await coach.ask(OWNER, "hi")
     assert expected in err.value.user_message
@@ -482,10 +482,8 @@ async def test_rebuild_keeps_a_backup(coach, claude):
 async def test_command_menu_is_registered(app):
     await bot.post_init(app)
     commands = [c["command"] for c in app.tg.sent("setMyCommands")[0]["commands"]]
-    assert commands == [
-        "ask", "today", "week", "plan", "nextweek", "log", "done", "shoulder",
-        "injury", "profile", "status", "reset", "whoami",
-    ]
+    assert commands == ["ask", "today", "week", "plan", "nextweek", "log", "done", "shoulder", "progress",
+        "injury", "away", "profile", "status", "reset", "whoami"]
 
 
 async def test_strangers_only_get_their_id(app, claude):
@@ -586,7 +584,7 @@ async def test_today_week_plan_and_nextweek(app, claude, clock):
 
 
 async def test_plan_error_is_reported(app, claude):
-    claude.enqueue({"mode": "error"})
+    claude.enqueue({"mode": "error"}, {"mode": "error"})
     texts = await send(app, "/plan")
     assert "I could not build the plan. Claude Code reported an error" in texts[-1]
 
@@ -710,7 +708,24 @@ async def test_week_on_saturday_explains_first(app, claude, clock):
 
 async def test_network_errors_get_a_plain_message(coach, claude):
     # the exact shape Claude Code 2.1 prints when it cannot connect
-    claude.enqueue({"mode": "error_result", "result": "API Error: Connection refused — a firewall or proxy may be blocking it (ECONNREFUSED)"})
+    refused = {"mode": "error_result", "result": "API Error: Connection refused — a firewall or proxy may be blocking it (ECONNREFUSED)"}
+    claude.enqueue(refused, refused)
     with pytest.raises(bot.ClaudeError) as err:
         await coach.ask(OWNER, "hi")
     assert "could not reach Anthropic's servers" in err.value.user_message
+
+
+
+async def test_brief_failures_are_retried_once(coach, claude):
+    claude.enqueue({"mode": "error"})  # a 500 once, then fine
+    assert "Coach says" in await coach.ask(OWNER, "hi")
+    assert len(claude.all()) == 2
+    assert coach.runner.last_call["ok"] is True
+
+
+@pytest.mark.parametrize("mode", ["auth", "limit", "maxturns", "nonjson"])
+async def test_lasting_failures_are_not_retried(coach, claude, mode):
+    claude.enqueue({"mode": mode})
+    with pytest.raises(bot.ClaudeError):
+        await coach.ask(OWNER, "hi")
+    assert len(claude.all()) == 1

@@ -41,9 +41,9 @@ def run(api: FakeBotAPI, expect_garmin: bool = True, claude_version: str = "2.1.
     # start up: command menu, webhook removed, long polling for messages and buttons only
     _, cmds = api.wait_for(lambda m, p: m == "setMyCommands", 60)
     names = [c["command"] for c in cmds["commands"]]
-    assert names == ["ask", "today", "week", "plan", "nextweek", "log", "done", "shoulder",
-                     "injury", "profile", "status", "reset", "whoami"], names
-    done.append("command menu registered (13 commands)")
+    assert names == ["ask", "today", "week", "plan", "nextweek", "log", "done", "shoulder", "progress",
+                     "injury", "away", "profile", "status", "reset", "whoami"], names
+    done.append("command menu registered (15 commands)")
     _, poll = api.wait_for(lambda m, p: m == "getUpdates" and "allowed_updates" in p, 60)
     assert sorted(poll["allowed_updates"]) == ["callback_query", "message"], poll
     done.append("long polling for messages and button presses")
@@ -108,7 +108,18 @@ def run(api: FakeBotAPI, expect_garmin: bool = True, claude_version: str = "2.1.
     mark = api.mark()
     api.message("/shoulder", OWNER)
     api.reply(OWNER, "3/10 (after session)", after=mark)
-    done.append("/shoulder log")
+    api.wait_for(lambda m, p: m == "sendDocument" and p.get("document", {}).get("filename", "").endswith(".csv"), after=mark)
+    done.append("/shoulder log with a CSV file for the physio")
+
+    mark = api.mark()
+    api.message("/progress", OWNER)
+    api.reply(OWNER, "Rows: 22 kg 3 x 10", after=mark)
+    done.append("/progress from the logged weights")
+
+    mark = api.mark()
+    api.message("/away tomorrow hotel gym only", OWNER)
+    api.reply(OWNER, "Saved: away", after=mark)
+    done.append("/away")
 
     mark = api.mark()
     api.message("/status", OWNER)
