@@ -201,6 +201,20 @@ The bot is built to keep running on the NAS without you watching it.
 - **Limits.** Each problem is looked at once every 12 hours, and at most 6 a day, so a repeating error doesn't run up usage. Every error is saved in `data/errors.jsonl`. `/status` shows the last problem, what was done, and how often the bot started this week.
 - `SELF_REPAIR=off` in `bot.env` skips the Claude diagnosis. You are still told about errors, and everything else above keeps working.
 
+## NAS Doctor
+
+nas-doctor (a separate stack, `/volume1/docker/nas-doctor`) watches every container on the NAS. When `gym-coach-bot` is crash-looping, dead, unhealthy (the health check above) or exited with an error, it posts to the "NAS Doctor" topic and asks `claude -p` to fix it. The bot's own self repair handles problems inside the process. NAS Doctor handles the container itself: a bad build, a broken mount or a container that won't start. `/fix gym-coach-bot` in the NAS Doctor chat runs the same repair on demand.
+
+Runbook for NAS Doctor (and anyone else fixing this stack):
+
+- Stack folder: `/volume1/docker/gym-coach`, container `gym-coach-bot`, compose file `compose.yaml`.
+- Never print, copy or rewrite `bot.env`, because it holds the tokens. Never delete or edit anything in `data/`, which is the user's training history. To repair a damaged file, restore its `.bak` copy and move the bad file to `data/broken/`.
+- Leave `/volume1/docker/garmin-monitor` alone. This stack only reads it.
+- Restart: `docker compose -f /volume1/docker/gym-coach/compose.yaml up -d`. After a code change, add `--build`.
+- Check: `docker inspect --format '{{.State.Health.Status}}' gym-coach-bot` should say `healthy` within 2 minutes, and `docker logs --tail 50 gym-coach-bot` should show no traceback.
+- "the token needs renewing" or `401` in the logs means `CLAUDE_CODE_OAUTH_TOKEN` has expired. Only James can fix this with `claude setup-token`, so report it and don't retry.
+- `Permission denied` on `/data` means `PUID`/`PGID` in `bot.env` don't match the owner of `data/` (James is `1000:10`).
+
 ## Everyday maintenance
 
 - **Renew the Claude token** once a year (the bot reminds you):

@@ -6,6 +6,7 @@ services:
         # Optional: pin Claude Code, e.g. sudo CLAUDE_CODE_VERSION=2.1.285 docker compose up -d --build
         CLAUDE_CODE_VERSION: ${CLAUDE_CODE_VERSION:-}
     image: gym-coach-bot:local
+    pull_policy: build   # Dockge "Update" rebuilds from these files instead of keeping the old image
     container_name: gym-coach-bot
     restart: unless-stopped
     init: true   # reaps helper processes that claude -p leaves behind

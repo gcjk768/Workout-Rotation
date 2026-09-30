@@ -1,0 +1,2 @@
+# Force LF: entrypoint.sh and tests/bin/claude run inside Linux containers.
+* text=auto eol=lf
