@@ -4,6 +4,7 @@ updated: 2026-10-01
 ---
 # Changelog
 ## 2026-10-01
+- feat: `/gymstatus` replaces `/status` in the menu (Garmin and the trading desk also had `/status`). the owner Channel shows every bot's commands in one `/` menu (no per-topic scope in Telegram), so names must be unique across bots. `/status` still works.
 - feat: `/coach <question>` replaces `/ask` in the menu (the owner Channel shares one `/` menu across every bot (Telegram has no per-topic command scope), so three bots' `/ask` collided.) `/ask` still works (`CommandHandler(["coach", "ask"])` in `bot.py`).
 - feat: Thursday is legs OR a run (plan gives both, you pick one), like Friday's run or swim.
 - feat: one body part per upper body day: `UPPER_BODY_ROTATION` = Chest, Back, Shoulders, Arms. Four parts slide across Mon–Wed, so one sits out each week (week 1 C/B/S, week 2 B/S/A, week 3 S/A/C, week 4 A/C/B).

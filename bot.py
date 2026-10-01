@@ -3118,7 +3118,7 @@ COMMANDS = [
     ("injury", "Show or replace your injury notes"),
     ("away", "Days away, on leave or travelling"),
     ("profile", "What the coach knows about you"),
-    ("status", "Claude Code, sign in and reminders"),
+    ("gymstatus", "Claude Code, sign in and reminders"),
     ("reset", "Clear the chat memory"),
     ("whoami", "Your Telegram user ID"),
 ]
@@ -3130,7 +3130,7 @@ HELP_TEXT = """Hi, I am your gym coach.
 • /plan rebuilds this week and /nextweek builds next week. Add notes after the command.
 • /log what you did, then /done when you finish a session.
 • /shoulder shows your shoulder ratings, /injury your injury notes.
-• /profile, /status, /reset and /whoami are there too."""
+• /profile, /gymstatus, /reset and /whoami are there too."""
 
 
 def coach_of(context: ContextTypes.DEFAULT_TYPE) -> Coach:
@@ -4150,7 +4150,7 @@ def add_handlers(application: Application, concurrent: bool = True) -> None:
     application.add_handler(CommandHandler("injury", cmd_injury))
     application.add_handler(CommandHandler("away", cmd_away))
     application.add_handler(CommandHandler("profile", cmd_profile))
-    application.add_handler(CommandHandler("status", cmd_status, **slow))
+    application.add_handler(CommandHandler(["gymstatus", "status"], cmd_status, **slow))
     application.add_handler(CommandHandler("reset", cmd_reset))
     application.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
     application.add_handler(

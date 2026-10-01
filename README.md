@@ -95,7 +95,7 @@ In the JSON reply, `"is_error": false` and a `result` text mean everything works
 | `/injury [notes]` | Show or replace your injury notes. `/injury none` clears them. |
 | `/away [dates] [note]` | Days away, on leave or travelling, for example `/away 8 Oct to 10 Oct Bangkok trip` or `/away thu fri`. `/away` lists them with upcoming public holidays, and `/away clear` removes them. |
 | `/profile` | What the coach knows about you, including your shoulder trend and Garmin data |
-| `/status` | Claude Code version, sign-in, the last plan built and the next reminders |
+| `/gymstatus` | (`/status` works too) Claude Code version, sign-in, the last plan built and the next reminders |
 | `/reset` | Clear the chat memory |
 | `/whoami` | Your Telegram user ID |
 
