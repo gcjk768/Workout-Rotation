@@ -2,7 +2,7 @@
 
 A private Telegram bot that coaches you like a personal trainer. It runs in Docker on your UGREEN NAS and uses Claude Code in headless mode (`claude -p`) for all its AI. Your Claude subscription pays for it, so no API billing is needed.
 
-- Answers training questions (`/ask`, or just write to it), with web search for real videos.
+- Answers training questions (`/coach`, or just write to it), with web search for real videos.
 - Builds a full 7-day plan every week. Monday to Wednesday are upper body days with one body part each (chest, back, shoulders, arms). Each body part moves one day earlier every week, so with four parts on three days one sits out each week in turn. The exercises change every week. The main equipment rotates (dumbbells, cables, machines, barbell and kettlebells). Effort follows a 4-week wave: three building weeks, then a deload.
 - Protects your left shoulder. Every new plan is checked for movements your injury rules leave out, first by a rule check and then by a quick second opinion from a small Claude model. If anything slips in, Claude fixes the plan once before it's saved.
 - Sends that day's workout every morning, with buttons for a lighter or a 30-minute version. It reminds you again before the gym and checks at 9pm whether you trained. On Sunday it asks how the week went, then builds next week's plan from your answer.
@@ -82,7 +82,7 @@ In the JSON reply, `"is_error": false` and a `result` text mean everything works
 
 | Command | What it does |
 |---|---|
-| `/ask <question>` | Ask the coach. In a private chat, a plain message works too. It remembers your last 6 questions. |
+| `/coach <question>` | Ask the coach (`/ask` works too). In a private chat, a plain message works too. It remembers your last 6 questions. |
 | `/today` | Today's workout card (see "Workout cards" below) |
 | `/day <day>` | Any day's workout card, for example `/day fri`. Once a day has passed and next week is built, it shows next week's. |
 | `/week` | The week in short: each day's body parts with sets, reps and weights. On Saturday and Sunday it shows next week's if it's built. |
