@@ -210,4 +210,4 @@ async def test_rehab_moves_may_repeat_and_are_tagged(coach, claude):
     coach.store.save_plan(date(2026, 9, 21), plan, {}, "x")
     assert coach.previous_exercises(date(2026, 9, 28)) == ["Cable row"]
     result = bot.PlanResult(date(2026, 9, 21), plan, {}, [])
-    assert "Cable row, Band external rotation (rehab)" in coach.overview(result, "x")
+    assert "Cable row, Band external rotation (rehab)" in "\n".join(coach.overview(result))

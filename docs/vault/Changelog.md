@@ -4,6 +4,9 @@ updated: 2026-10-01
 ---
 # Changelog
 ## 2026-10-01
+- feat: every Telegram message uses the HTML card style: header `emoji <b>TITLE</b> · subtitle` (fixed emoji per message type in `SECTION_TITLES`, built by `header()`/`card()` in `bot.py`), one block per item, `━━━━━━━━━━━━━━━━` between body-part sections, hints in `<i>`, background (split reasoning, plan notes, last week in numbers) folded in `<blockquote expandable>` at the end. Workout cards: one block per exercise `🫸 <b>1 · Bench</b> · <code>3 × 10</code> @ <b>12.5 kg</b>`, then a ⏸ rest/effort line and a ▶️ Form video link.
+- refactor: one send path. `send_view` → `send_blocks` for everything (old `send_text` removed); text and Claude answers go through `text_blocks` (escaped by `to_html`). `pack_blocks` cuts only between blocks, or inside an oversized block at a line outside every tag (`split_block`). Telegram 400 → resent as plain text (`html_to_plain`). The repair mirror to `REPAIR_ALERT_CHAT` uses it too (was a raw `[:4096]` cut that could split a tag). Tests: `tests/test_card_style.py`.
+- test: `e2e_scenario.py` command menu updated to `/coach` + `/gymstatus` (was failing since those renames).
 - feat: `/gymstatus` replaces `/status` in the menu (Garmin and the trading desk also had `/status`). the owner Channel shows every bot's commands in one `/` menu (no per-topic scope in Telegram), so names must be unique across bots. `/status` still works.
 - feat: `/coach <question>` replaces `/ask` in the menu (the owner Channel shares one `/` menu across every bot (Telegram has no per-topic command scope), so three bots' `/ask` collided.) `/ask` still works (`CommandHandler(["coach", "ask"])` in `bot.py`).
 - feat: Thursday is legs OR a run (plan gives both, you pick one), like Friday's run or swim.

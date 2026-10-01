@@ -41,8 +41,8 @@ def run(api: FakeBotAPI, expect_garmin: bool = True, claude_version: str = "2.1.
     # start up: command menu, webhook removed, long polling for messages and buttons only
     _, cmds = api.wait_for(lambda m, p: m == "setMyCommands", 60)
     names = [c["command"] for c in cmds["commands"]]
-    assert names == ["ask", "today", "week", "day", "plan", "nextweek", "log", "done", "shoulder", "progress",
-                     "injury", "away", "profile", "status", "reset", "whoami"], names
+    assert names == ["coach", "today", "week", "day", "plan", "nextweek", "log", "done", "shoulder", "progress",
+                     "injury", "away", "profile", "gymstatus", "reset", "whoami"], names
     done.append("command menu registered (16 commands)")
     _, poll = api.wait_for(lambda m, p: m == "getUpdates" and "allowed_updates" in p, 60)
     assert sorted(poll["allowed_updates"]) == ["callback_query", "message"], poll
@@ -80,7 +80,7 @@ def run(api: FakeBotAPI, expect_garmin: bool = True, claude_version: str = "2.1.
     mark = api.mark()
     api.message("/plan", OWNER)
     api.reply(OWNER, "Building this week's plan", after=mark)
-    plan = api.reply(OWNER, "📅 Monday", timeout=120 * slow, after=mark)
+    plan = api.reply(OWNER, "📅 <b>Monday</b>", timeout=120 * slow, after=mark)
     assert "Week 1" in plan["text"], plan["text"][:200]
     done.append("/plan built and sent week 1")
 
@@ -91,7 +91,7 @@ def run(api: FakeBotAPI, expect_garmin: bool = True, claude_version: str = "2.1.
 
     mark = api.mark()
     api.message("/day fri", OWNER)
-    friday = api.reply(OWNER, "📅 Friday", after=mark)
+    friday = api.reply(OWNER, "📅 <b>FRIDAY", after=mark)
     assert friday.get("parse_mode") == "HTML", friday
     if not real_claude:  # the fake returns a structured plan: body part workout cards
         assert "<blockquote expandable>" in friday["text"] and "SWIM" in friday["text"], friday["text"][:300]
@@ -109,19 +109,19 @@ def run(api: FakeBotAPI, expect_garmin: bool = True, claude_version: str = "2.1.
     assert len(rate) == 11 and rate[3].endswith(":3"), rate
     mark = api.mark()
     api.press(rate[3], OWNER, message_id=int(done_msg.get("message_id", 1) or 1))
-    api.reply(OWNER, "Left shoulder 3/10 saved", after=mark)
-    api.reply(OWNER, "Trend: Latest 3/10", after=mark)
+    api.reply(OWNER, "3/10 saved", after=mark)
+    api.reply(OWNER, "Trend</b> · Latest 3/10", after=mark)
     done.append("/done with 0 to 10 buttons, rating saved")
 
     mark = api.mark()
     api.message("/shoulder", OWNER)
-    api.reply(OWNER, "3/10 (after session)", after=mark)
+    api.reply(OWNER, "3/10</b> (after session)", after=mark)
     api.wait_for(lambda m, p: m == "sendDocument" and p.get("document", {}).get("filename", "").endswith(".csv"), after=mark)
     done.append("/shoulder log with a CSV file for the physio")
 
     mark = api.mark()
     api.message("/progress", OWNER)
-    api.reply(OWNER, "Rows: 22 kg 3 x 10", after=mark)
+    api.reply(OWNER, "<b>Rows</b> · 22 kg 3 x 10", after=mark)
     done.append("/progress from the logged weights")
 
     mark = api.mark()
@@ -132,7 +132,7 @@ def run(api: FakeBotAPI, expect_garmin: bool = True, claude_version: str = "2.1.
     mark = api.mark()
     api.message("/status", OWNER)
     status = api.reply(OWNER, "Next reminders", timeout=60, after=mark)["text"]
-    assert f"Version: {claude_version}" in status, status
+    assert f"Version: <code>{claude_version}" in status, status
     assert "Session reminder" in status and "Sunday check in" in status, status
     if expect_garmin:
         assert "✅ Profile Me: latest data" in status, status

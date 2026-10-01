@@ -487,20 +487,20 @@ async def test_command_menu_is_registered(app):
 
 async def test_strangers_only_get_their_id(app, claude):
     texts = await send(app, "/today", user_id=STRANGER)
-    assert texts == [f"Sorry, this is a private bot. Your Telegram user ID is <code>{STRANGER}</code>."]
+    assert texts == [f"🔒 <b>PRIVATE BOT</b>\n\nSorry, this is a private bot. Your Telegram user ID is <code>{STRANGER}</code>."]
     texts = await send(app, "hello coach", user_id=STRANGER)
     assert texts == []  # rate limited, and nothing reaches Claude
     assert claude.all() == []
 
 
 async def test_whoami(app):
-    assert await send(app, "/whoami") == [f"Your Telegram user ID is <code>{OWNER}</code>."]
+    assert await send(app, "/whoami") == [f"🪪 <b>YOUR ID</b>\n\nYour Telegram user ID is <code>{OWNER}</code>."]
 
 
 async def test_ask_command_and_plain_messages(app, claude):
     texts = await send(app, "/ask What should I eat before training?")
     assert len(texts) == 1
-    assert texts[0].startswith("<b>Coach says:</b> keep it light today.")
+    assert texts[0].startswith("💬 <b>COACH</b>\n\n<b>Coach says:</b> keep it light today.")
     assert "• Goblet squat 3 x 10" in texts[0]
     assert 'href="https://www.youtube.com/results?search_query=goblet+squat+proper+form"' in texts[0]
     sent = app.tg.sent()[-1]
@@ -534,7 +534,7 @@ async def test_html_rejection_falls_back_to_plain_text(app, claude):
     await send(app, "/ask anything")
     last = app.tg.sent()[-1]
     assert "parse_mode" not in last
-    assert last["text"].startswith("Coach says: keep it light today.")
+    assert last["text"].startswith("💬 COACH\n\nCoach says: keep it light today.")
     assert "https://www.youtube.com/results?search_query=goblet+squat+proper+form" in last["text"]
 
 
@@ -554,17 +554,17 @@ async def test_claude_error_reaches_the_user(app, claude):
 async def test_reset(app, claude):
     await send(app, "/ask hi")
     assert app.bot_data["coach"].store.memory(OWNER)
-    assert await send(app, "/reset") == ["Chat memory cleared."]
+    assert await send(app, "/reset") == ["🧹 <b>CHAT MEMORY</b>\n\nChat memory cleared."]
     assert app.bot_data["coach"].store.memory(OWNER) == []
 
 
 async def test_today_week_plan_and_nextweek(app, claude, clock):
     assert "Send /plan" in (await send(app, "/today"))[0]
     texts = await send(app, "/plan")
-    assert texts[0].startswith("Building this week's plan")
-    assert texts[1].startswith("<b>Week 1 · dumbbells · building week 1 of 3 · Mon 28 Sep to Sun 4 Oct</b>")
+    assert "Building this week's plan" in texts[0]
+    assert texts[1].startswith("🗓 <b>WEEK PLAN</b> · Week 1 · dumbbells · building week 1 of 3 · Mon 28 Sep to Sun 4 Oct")
     today = await send(app, "/today")
-    assert today[0].startswith("📅 Wednesday: Legs and core")
+    assert today[0].startswith("📅 <b>WORKOUT</b> · Wed 30 Sep\n\n📅 Wednesday: Legs and core")
     assert "📅 Thursday" not in today[0]
     week = await send(app, "/week")
     assert "📅 Monday: Push" in week[0] and "📝 Notes" in "".join(week)
@@ -579,7 +579,7 @@ async def test_today_week_plan_and_nextweek(app, claude, clock):
     week = await send(app, "/week")
     assert "Week 2 · cables" in week[0]
     today = await send(app, "/today")
-    assert today[0].startswith("📅 Saturday")
+    assert today[0].startswith("📅 <b>WORKOUT</b> · Sat 3 Oct\n\n📅 Saturday")
 
 
 async def test_plan_error_is_reported(app, claude):
@@ -590,13 +590,13 @@ async def test_plan_error_is_reported(app, claude):
 
 async def test_injury_command(app, claude):
     texts = await send(app, "/injury")
-    assert "Left shoulder micro tear" in texts[0] and "(from bot.env)" in texts[0]
+    assert "Left shoulder micro tear" in texts[0] and "· from bot.env" in texts[0]
     await send(app, "/injury Physio cleared light pressing on 1 Oct")
     texts = await send(app, "/injury")
     assert "Physio cleared light pressing" in texts[0] and "updated 2026-09-30" in texts[0]
     await send(app, "/ask hi")
     assert "Physio cleared light pressing" in claude.last()["system"]
-    assert await send(app, "/injury none") == ["Injury notes cleared."]
+    assert await send(app, "/injury none") == ["🤕 <b>INJURY NOTES</b> · cleared\n\nInjury notes cleared."]
     await send(app, "/ask hi")
     assert "My latest injury notes (updated 2026-09-30): none." in claude.last()["system"]
 
@@ -608,7 +608,7 @@ async def test_profile_and_status(app, claude):
     assert "Split this week: Monday: Chest, Tuesday: Back, Wednesday: Shoulders," in profile
     assert "Left shoulder micro tear" in profile
     status = (await send(app, "/status"))[0]
-    assert "Version: 2.1.999 (Claude Code)" in status
+    assert "Version: <code>2.1.999 (Claude Code)</code>" in status
     assert "✅ signed in with oauth_token" in status
     assert "Token created 2026-01-15, expires about 2027-01-15" in status
     assert "Last plan built Wed 30 Sep 12:00" in status
@@ -701,7 +701,7 @@ async def test_week_on_saturday_explains_first(app, claude, clock):
     await send(app, "/plan")
     clock.set(2026, 10, 3, 10, 0)
     week = "".join(await send(app, "/week"))
-    assert week.startswith("Next week's plan is not built yet.")
+    assert week.startswith("🗓 <b>WEEK PLAN</b>") and "Next week's plan is not built yet." in week
     assert "Here is this week's plan until then." in week
 
 

@@ -96,13 +96,14 @@ async def test_unexpected_error_is_diagnosed_and_repaired(app, claude, clock):
     assert "Source around the failing lines:\nfmt_day(), bot.py lines" in stdin and '>     return f"{d:%a}' in stdin
     assert "- repair_file:" in stdin and "away.json (" in stdin
     texts = app.tg.texts()
-    assert texts[0].startswith("Sorry, something went wrong on my side. I am looking into it")
+    assert texts[0].startswith("⚠️ <b>PROBLEM</b>\n\nSorry, something went wrong on my side. I am looking into it")
     report = texts[-1]
-    assert "🩺 <b>Self repair</b>\nSomething went wrong in the /today command (TypeError)." in report
-    assert "<b>What Claude found:</b> away.json is damaged." in report
-    assert "<b>What I did:</b> I restored away.json from its last good copy." in report
+    assert report.startswith("🛠 <b>SELF REPAIR</b> · the /today command\n\nSomething went wrong in the /today command (TypeError).")
+    assert "🔍 <b>What Claude found</b> · away.json is damaged." in report
+    assert "🔧 <b>What I did</b> · I restored away.json from its last good copy." in report
     assert "Your travel days were restored." in report
-    assert "<b>🛠 Suggested code change</b> <i>for the next update, tap to open</i>\n<blockquote expandable>Guard fmt_day against None.</blockquote>" in report
+    assert ("━━━━━━━━━━━━━━━━\n🧑‍💻 <b>Suggested code change</b> · <i>for the next update, tap to open</i>\n"
+            "<blockquote expandable>Guard fmt_day against None.</blockquote>") in report
     assert check_message({"text": report, "parse_mode": "HTML"}) is None
     assert store.read_json("away.json", None) == [{"from": "2026-10-08"}]
     health = store.read_json("health.json", {})
@@ -257,7 +258,7 @@ async def test_restart_notice_after_an_unexpected_stop(app, clock):
     assert unexpected == {"reason": "it stopped responding for 10 minutes"}
     job = SimpleNamespace(data=unexpected, name="restart_notice")
     await bot.job_restart_notice(SimpleNamespace(bot=app.bot, application=app, job=job))
-    assert app.tg.texts()[-1].startswith("♻️ I restarted after an unexpected stop (it stopped responding for 10 minutes).")
+    assert app.tg.texts()[-1].startswith("♻️ <b>BACK ONLINE</b>\n\nI restarted after an unexpected stop (it stopped responding for 10 minutes).")
     assert len(coach.store.read_json("health.json", {})["starts"]) == 4
 
 
@@ -308,7 +309,7 @@ async def test_self_repair_off_still_tells_the_owner(env, clock, claude):
     try:
         await bot.on_error(None, ctx(app, failing()))
         assert repair_calls(claude) == []
-        assert tg.texts()[-1].endswith("The details are saved in data/errors.jsonl.")
+        assert tg.texts()[-1].endswith("<i>The details are saved in data/errors.jsonl.</i>")
     finally:
         await app.shutdown()
 
@@ -331,10 +332,10 @@ async def test_repair_alerts_are_mirrored_to_the_alert_chat(env, clock, claude):
         await bot.on_error(None, ctx(app, failing()))
         mirror = [p for p in tg.sent() if int(p["chat_id"]) == <TELEGRAM_CHAT_ID>]
         assert len(mirror) == 1 and int(mirror[0]["message_thread_id"]) == 2930
-        assert mirror[0]["text"].startswith("<b>gym-coach-bot</b>\n🩺 <b>Self repair</b>")
-        assert "<b>What Claude found:</b> A bug." in mirror[0]["text"] and "Guard it." in mirror[0]["text"]
+        assert mirror[0]["text"].startswith("🏋️ <b>gym-coach-bot</b>\n\n🛠 <b>SELF REPAIR</b>")
+        assert "<b>What Claude found</b> · A bug." in mirror[0]["text"] and "Guard it." in mirror[0]["text"]
         assert check_message({"text": mirror[0]["text"], "parse_mode": "HTML"}) is None
-        assert any(int(p["chat_id"]) == OWNER and "Self repair" in p["text"] for p in tg.sent())
+        assert any(int(p["chat_id"]) == OWNER and "SELF REPAIR" in p["text"] for p in tg.sent())
         tg.blocked_chats.add(<TELEGRAM_CHAT_ID>)  # a failed mirror must not break anything
         claude.enqueue(remedy(diagnosis="Another."))
         await bot.on_error(None, ctx(app, ValueError("other")))
