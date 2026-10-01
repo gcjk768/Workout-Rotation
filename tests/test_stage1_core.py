@@ -407,7 +407,7 @@ async def test_first_plan_sets_week_one_and_the_rotating_split(coach, claude):
     assert meta["week"] == 1 and meta["equipment"] == "dumbbells" and meta["effort"].startswith("Building week 1")
     request = claude.last()["stdin"]
     assert "Week number: 1" in request and "Main equipment this week: dumbbells" in request
-    assert "Monday: Chest and triceps\nTuesday: Back and biceps\nWednesday: Shoulders and core" in request
+    assert "Monday: Chest\nTuesday: Back\nWednesday: Shoulders\n" in request
     assert "Thursday: Legs, then an easy run\nFriday: Run or swim" in request
     assert "I did not send a Sunday check in answer" in request
     assert "📅 Monday: Push" in request  # format rules are included
@@ -421,7 +421,7 @@ async def test_following_weeks_rotate_and_avoid_repeats(coach, claude):
     await coach.build_week(date(2026, 10, 5))
     request = claude.last()["stdin"]
     assert "Week number: 2" in request and "Main equipment this week: cables" in request
-    assert "Monday: Back and biceps\nTuesday: Shoulders and core\nWednesday: Chest and triceps" in request
+    assert "Monday: Back\nTuesday: Shoulders\nWednesday: Arms\n" in request
     assert "Dumbbells move W1 D1 N1" in request  # last week's exercises are listed
     await coach.build_week(date(2026, 10, 12))
     request = claude.last()["stdin"]
@@ -605,7 +605,7 @@ async def test_profile_and_status(app, claude):
     await send(app, "/plan")
     profile = (await send(app, "/profile"))[0]
     assert "Age 31, height 183 cm, weight 78 kg" in profile
-    assert "Split this week: Monday: Chest and triceps, Tuesday: Back and biceps" in profile
+    assert "Split this week: Monday: Chest, Tuesday: Back, Wednesday: Shoulders," in profile
     assert "Left shoulder micro tear" in profile
     status = (await send(app, "/status"))[0]
     assert "Version: 2.1.999 (Claude Code)" in status
