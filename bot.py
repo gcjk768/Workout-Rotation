@@ -3105,7 +3105,7 @@ class Coach:
 # ---------------------------------------------------------------------------
 
 COMMANDS = [
-    ("ask", "Ask your coach anything"),
+    ("coach", "Ask your coach anything"),
     ("today", "Today's workout"),
     ("week", "This week's plan (next week's on weekends)"),
     ("day", "Any day's workout, like /day fri"),
@@ -3125,7 +3125,7 @@ COMMANDS = [
 
 HELP_TEXT = """Hi, I am your gym coach.
 
-• Just write to me, or use /ask, with any training question.
+• Just write to me, or use /coach, with any training question.
 • /today shows today's workout, /day fri any day's, and /week the whole week.
 • /plan rebuilds this week and /nextweek builds next week. Add notes after the command.
 • /log what you did, then /done when you finish a session.
@@ -4134,7 +4134,7 @@ def add_handlers(application: Application, concurrent: bool = True) -> None:
     slow = {"block": not concurrent}
     application.add_handler(CommandHandler(["start", "help"], cmd_start))
     application.add_handler(CommandHandler("whoami", cmd_whoami))
-    application.add_handler(CommandHandler("ask", cmd_ask, **slow))
+    application.add_handler(CommandHandler(["coach", "ask"], cmd_ask, **slow))
     application.add_handler(CommandHandler("today", cmd_today))
     application.add_handler(CommandHandler("week", cmd_week))
     application.add_handler(CommandHandler("day", cmd_day))
