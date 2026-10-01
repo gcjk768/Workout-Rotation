@@ -482,7 +482,7 @@ async def test_command_menu_is_registered(app):
     await bot.post_init(app)
     commands = [c["command"] for c in app.tg.sent("setMyCommands")[0]["commands"]]
     assert commands == ["coach", "today", "week", "day", "plan", "nextweek", "log", "done", "shoulder", "progress",
-        "injury", "away", "profile", "status", "reset", "whoami"]
+        "injury", "away", "profile", "gymstatus", "reset", "whoami"]
 
 
 async def test_strangers_only_get_their_id(app, claude):
