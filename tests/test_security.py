@@ -71,7 +71,7 @@ async def test_scheduled_build_keeps_a_plan_built_while_it_waited(app, claude, c
     await task
     assert len(claude.plan_calls()) == calls  # nothing rebuilt
     assert "user plan" in coach.store.load_plan(date(2026, 10, 5))
-    assert app.tg.texts()[-1].startswith("🗓 Next week's plan was already built.")
+    assert app.tg.texts()[-1].startswith("🗓 <b>NEXT WEEK</b>") and "Next week's plan was already built." in app.tg.texts()[-1]
 
 
 async def test_leftover_prompt_files_are_removed_at_start(app):

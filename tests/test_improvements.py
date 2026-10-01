@@ -88,7 +88,7 @@ async def test_watch_workout_marks_the_day_done(app, claude, clock, cfg):
     clock.set(2026, 9, 30, 21, 0)
     await bot.job_evening_check(ctx(app))
     sent = app.tg.sent()[-1]
-    assert sent["text"].startswith("✅ Your watch shows a 52 min strength training session today, so I marked today as done.")
+    assert sent["text"].startswith("✅ <b>SESSION DONE</b> · from your watch\n\nYour watch shows a 52 min strength training session today, so I marked today as done.")
     assert "rate:2026-09-30:3" in str(sent["reply_markup"])
     assert app.bot_data["coach"].store.sessions()["2026-09-30"]["source"] == "garmin"
 
@@ -101,7 +101,7 @@ async def test_auto_detected_moves_do_not_count(app, claude, clock, cfg):
     ])
     clock.set(2026, 9, 30, 21, 0)
     await bot.job_evening_check(ctx(app))
-    assert app.tg.texts()[-1] == "Did you train today (Legs and core)?"
+    assert app.tg.texts()[-1] == "🌙 <b>EVENING CHECK</b> · Wed 30 Sep\n\nDid you train today (Legs and core)?"
 
 
 async def test_auto_done_can_be_turned_off(env, clock, claude, cfg):
@@ -151,19 +151,19 @@ def test_singapore_public_holidays():
 
 async def test_away_command_and_plan_request(app, claude, clock):
     texts = await send(app, "/away 1 Oct to 2 Oct Bangkok trip")
-    assert texts[0].startswith("Saved: away Thu 1 Oct to Fri 2 Oct (Bangkok trip).")
+    assert "Saved: away Thu 1 Oct to Fri 2 Oct (Bangkok trip)." in texts[0]
     await send(app, "/plan")
     request = claude.plan_calls()[-1]["stdin"]
     assert "Days off this week. On these days give a hotel gym or bodyweight version" in request
     assert "Thu 1 Oct: away (Bangkok trip)\nFri 2 Oct: away (Bangkok trip)" in request
     listing = (await send(app, "/away"))[0]
-    assert "• Thu 1 Oct to Fri 2 Oct (Bangkok trip)" in listing
+    assert "✈️ <b>Thu 1 Oct to Fri 2 Oct</b> · Bangkok trip" in listing
     clock.set(2026, 10, 1, 12, 0)
     today = (await send(app, "/today"))[0]
-    assert today.startswith("✈️ You are away today (Bangkok trip).")
+    assert today.startswith("📅 <b>WORKOUT</b> · Thu 1 Oct\n\n✈️ You are away today (Bangkok trip).")
     await send(app, "/ask what can I do in the hotel?")
     assert "Days off in the next two weeks" in claude.last()["system"]
-    assert (await send(app, "/away clear")) == ["Days away cleared."]
+    assert (await send(app, "/away clear")) == ["✈️ <b>DAYS AWAY</b> · cleared\n\nDays away cleared."]
     assert "No days away saved." in (await send(app, "/away"))[0]
 
 
@@ -206,8 +206,8 @@ async def test_progress_command_and_context(app, claude, clock):
     clock.set(2026, 9, 29, 19, 0)
     await send(app, "/log row 22kg 3x10, push ups 3x12")
     text = (await send(app, "/progress"))[0]
-    assert "Row: 20 → 22 kg (+2 kg), last 3 x 10 · 2 sessions, latest Tue 29 Sep" in text
-    assert "Push ups: 3 x 12 · 1 session" in text
+    assert "🏋️ <b>Row</b> · 20 → 22 kg 🟢 ▲2 kg\n📅 2 sessions, latest Tue 29 Sep, last 3 x 10" in text
+    assert "🏋️ <b>Push ups</b> · 3 x 12\n📅 1 session" in text
     await send(app, "/ask what weight next?")
     system = claude.last()["system"]
     assert "Weights and reps from my logs, last 8 weeks" in system

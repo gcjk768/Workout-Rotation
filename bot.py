@@ -1256,33 +1256,6 @@ def topic(chat_id: int) -> int | None:
     return BOT_CHAT[1] if BOT_CHAT and BOT_CHAT[0] == chat_id else None
 
 
-async def send_text(bot, chat_id: int, text: str, reply_markup=None) -> list:
-    """Send as HTML in chunks under 4096 characters; plain text if Telegram objects."""
-    chunks = split_text(text)
-    sent = []
-    for i, chunk in enumerate(chunks):
-        markup = reply_markup if i == len(chunks) - 1 else None
-        video = find_video_link(chunk)
-        preview = LinkPreviewOptions(url=video) if video else LinkPreviewOptions(is_disabled=True)
-        try:
-            msg = await bot.send_message(
-                chat_id,
-                to_html(chunk),
-                parse_mode=ParseMode.HTML,
-                link_preview_options=preview,
-                reply_markup=markup,
-                message_thread_id=topic(chat_id),
-            )
-        except BadRequest as exc:
-            log.warning("Telegram rejected the HTML (%s), sending plain text", exc)
-            msg = await bot.send_message(
-                chat_id, to_plain(chunk), link_preview_options=preview, reply_markup=markup,
-                message_thread_id=topic(chat_id),
-            )
-        sent.append(msg)
-    return sent
-
-
 @contextlib.asynccontextmanager
 async def typing(bot, chat_id: int):
     """Show 'typing...' until the block finishes."""
@@ -2113,23 +2086,79 @@ def _h(text: str) -> str:
     return html.escape(text, quote=False)
 
 
-def _dose_html(ex: dict) -> str:
-    parts = [f"<code>{_h(f'{ex['sets']} × {ex['reps']}' if ex['sets'] else ex['reps'])}</code>"]
-    if ex["load"]:
-        parts.append(f"<b>{_h(ex['load'])}</b>")
-    if ex["rest_s"]:
-        rest = ex["rest_s"]
-        parts.append(f"rest {rest // 60} min {rest % 60} s" if rest >= 60 and rest % 60 else
-                     (f"rest {rest // 60} min" if rest >= 60 else f"rest {rest} s"))
-    if ex["effort"]:
-        parts.append(_h(ex["effort"]))
-    return " · ".join(parts)
+# The card style every message uses: a header line, one block per item, a divider
+# between big groups and background folded into an expandable quote at the end.
+DIVIDER = "━━━━━━━━━━━━━━━━"
+SECTION_TITLES = {  # message type -> (fixed emoji, TITLE)
+    "help": ("💪", "GYM COACH"),
+    "whoami": ("🪪", "YOUR ID"),
+    "private": ("🔒", "PRIVATE BOT"),
+    "coach": ("💬", "COACH"),
+    "error": ("⚠️", "PROBLEM"),
+    "log": ("📝", "WORKOUT LOG"),
+    "done": ("✅", "SESSION DONE"),
+    "skipped": ("⏭", "SKIPPED"),
+    "shoulder": ("🩹", "LEFT SHOULDER"),
+    "progress": ("📈", "PROGRESS"),
+    "workout": ("📅", "WORKOUT"),
+    "morning": ("☀️", "GOOD MORNING"),
+    "session": ("🏋️", "TODAY'S SESSION"),
+    "evening": ("🌙", "EVENING CHECK"),
+    "week": ("🗓", "WEEK PLAN"),
+    "nextweek": ("🗓", "NEXT WEEK"),
+    "plan": ("🔨", "PLAN BUILDER"),
+    "checkin": ("📋", "WEEKLY CHECK IN"),
+    "injury": ("🤕", "INJURY NOTES"),
+    "away": ("✈️", "DAYS AWAY"),
+    "memory": ("🧹", "CHAT MEMORY"),
+    "profile": ("👤", "PROFILE"),
+    "status": ("🩺", "GYM STATUS"),
+    "repair": ("🛠", "SELF REPAIR"),
+    "selfcheck": ("🔍", "SELF CHECK"),
+    "restart": ("♻️", "BACK ONLINE"),
+    "token": ("🔑", "CLAUDE TOKEN"),
+}
+
+
+def header(kind: str, subtitle: str = "") -> str:
+    """`emoji <b>TITLE</b> · subtitle`, the first line of every message."""
+    emoji, title = SECTION_TITLES[kind]
+    return f"{emoji} <b>{title}</b>" + (f" · {_h(subtitle)}" if subtitle else "")
+
+
+def text_blocks(text: str) -> list[str]:
+    """Light markdown (Claude's answers too) -> escaped HTML blocks, one per paragraph."""
+    blocks = [to_html(p) for p in re.split(r"\n\s*\n", text or "") if p.strip()]
+    return [b for b in blocks if b] or [to_html("(empty)")]
+
+
+def card(kind: str, subtitle: str = "", *parts: str, hint: str = "", background: str = "") -> list[str]:
+    """A whole message: header, the parts (light markdown, escaped), an italic hint and
+    background detail folded at the end."""
+    blocks = [header(kind, subtitle)]
+    for part in parts:
+        if part and part.strip():
+            blocks += text_blocks(part)
+    if hint:
+        blocks.append(f"<i>{_h(hint)}</i>")
+    if background:
+        blocks.append(f"{DIVIDER}\n<blockquote expandable>{to_html(background)}</blockquote>")
+    return blocks
+
+
+def warnings_text(warnings: list[str]) -> str:
+    return "⚠️ **Please check**\n" + "\n".join(f"• {w}" for w in warnings) if warnings else ""
+
+
+def _rest(rest: int) -> str:
+    return (f"rest {rest // 60} min {rest % 60} s" if rest >= 60 and rest % 60 else
+            (f"rest {rest // 60} min" if rest >= 60 else f"rest {rest} s"))
 
 
 def day_card_blocks(day: dict, subtitle: str = "", when: date | None = None) -> list[str]:
-    """One day's workout as Telegram HTML blocks, grouped by body part."""
+    """One day's workout as card blocks: a section per body part, a block per exercise."""
     name = f"{day['day']} {when.day} {when:%b}" if when else day["day"]
-    head = [f"<b>📅 {_h(name)} · {_h(day['focus'])}</b>"]
+    head = [f"{SECTION_TITLES['workout'][0]} <b>{_h(name.upper())}</b> · {_h(day['focus'])}"]
     if subtitle:
         head.append(f"<i>{_h(subtitle)}</i>")
     sets = sum(ex["sets"] for sec in day["sections"] for ex in sec["exercises"])
@@ -2147,26 +2176,34 @@ def day_card_blocks(day: dict, subtitle: str = "", when: date | None = None) -> 
         head.append(f"💬 {_h(day['note'])}")
     blocks = ["\n".join(head)]
     if day["warm_up"]:
-        blocks.append("<b>🔥 WARM UP</b>\n" + "\n".join(f"• {_h(w)}" for w in day["warm_up"]))
+        blocks.append("🔥 <b>Warm up</b>\n" + "\n".join(f"• {_h(w)}" for w in day["warm_up"]))
     number = 0
     for sec in day["sections"]:
-        title = f"<b>{body_part_emoji(sec['body_part'])} {_h(sec['body_part'].upper())}</b>"
+        emoji = body_part_emoji(sec["body_part"])
+        title = f"{DIVIDER}\n{emoji} <b>{_h(sec['body_part'].upper())}</b>"
         if "rehab" in sec["body_part"].lower():
-            title += " <i>(confirm with your physio)</i>"
+            title += " · <i>confirm with your physio</i>"
         cards = []
         for ex in sec["exercises"]:
             number += 1
             label = ex["superset"] or str(number)
-            lines = [f"<b>{_h(label)} · {_h(ex['name'])}</b>", _dose_html(ex)]
+            dose = f"{ex['sets']} × {ex['reps']}" if ex["sets"] else ex["reps"]
+            top = f"{emoji} <b>{_h(label)} · {_h(ex['name'])}</b> · <code>{_h(dose)}</code>"
+            if ex["load"]:
+                top += f" @ <b>{_h(ex['load'])}</b>"
+            lines = [top]
+            effort = [p for p in (_rest(ex["rest_s"]) if ex["rest_s"] else "", _h(ex["effort"])) if p]
+            if effort:
+                lines.append("⏸ " + " · ".join(effort))
+            if VIDEO_LINK_RE.fullmatch(ex["video"]):  # a real video link: shown with a preview
+                lines.append(f'▶️ <a href="{html.escape(ex["video"])}">Form video</a>')
+            elif ex["video"]:
+                lines.append(f'▶️ <a href="{html.escape(yt_search_url(ex["video"]))}">Form video</a>')
             details = []
             if ex["cue"]:
                 details.append(f"💡 {_h(ex['cue'])}")
             if ex["left_arm"]:
                 details.append(f"🦾 Left arm: {_h(ex['left_arm'])}")
-            if VIDEO_LINK_RE.fullmatch(ex["video"]):  # a real video link: shown with a preview
-                details.append(f'▶️ <a href="{html.escape(ex["video"])}">Form video</a>')
-            elif ex["video"]:
-                details.append(f'▶️ <a href="{html.escape(yt_search_url(ex["video"]))}">Form video: {_h(ex["video"])}</a>')
             if ex["muscles"]:
                 details.append(f"🎯 {_h(ex['muscles'])}")
             if ex["tempo"]:
@@ -2179,21 +2216,21 @@ def day_card_blocks(day: dict, subtitle: str = "", when: date | None = None) -> 
         if cards:  # the title stays with the first card when the day spans two messages
             blocks += [title + "\n\n" + cards[0], *cards[1:]]
     if day["cool_down"]:
-        blocks.append("<b>🧊 COOL DOWN</b>\n" + "\n".join(f"• {_h(c)}" for c in day["cool_down"]))
+        blocks.append(f"{DIVIDER}\n🧊 <b>Cool down</b>\n" + "\n".join(f"• {_h(c)}" for c in day["cool_down"]))
     if not day["rest_day"] and day["sections"]:
-        blocks.append("📝 Log your weights with /log, then send /done when you finish.")
+        blocks.append("<i>📝 Log your weights with /log, then send /done when you finish.</i>")
     return blocks
 
 
-def week_summary_blocks(plan: dict, title: str, marks: dict[str, str] | None = None) -> list[str]:
+def week_summary_blocks(plan: dict, title: str, marks: dict[str, str] | None = None,
+                        note: str = "", warnings: list[str] | None = None) -> list[str]:
     """The whole week in short: each day's body parts with sets, reps and loads.
     marks: day name -> ✅ or ⏭ for sessions already done or skipped."""
-    head = f"<b>🗓 {_h(title)}</b>"
-    if plan["split_explanation"]:
-        head += f"\n<blockquote expandable>🧠 {_h(plan['split_explanation'])}</blockquote>"
-    blocks = [head]
+    blocks = [header("week", title)]
+    if note:
+        blocks.append(to_html(note))
     for day in plan["days"]:
-        top = f"<b>📅 {_h(day['day'])} · {_h(day['focus'])}</b>"
+        top = f"📅 <b>{_h(day['day'])}</b> · {_h(day['focus'])}"
         if marks and marks.get(day["day"]):
             top += f" {marks[day['day']]}"
         if day["minutes"] and day["sections"]:
@@ -2207,11 +2244,18 @@ def week_summary_blocks(plan: dict, title: str, marks: dict[str, str] | None = N
                 items.append(f"{_h(ex['name'])} {_h(dose)}{_h(load)}")
             lines.append(f"{body_part_emoji(sec['body_part'])} <b>{_h(sec['body_part'])}</b>: " + " · ".join(items))
         if not day["sections"] and day["note"]:
-            lines.append(_h(day["note"]))
+            lines.append(f"💬 {_h(day['note'])}")
         blocks.append("\n".join(lines))
+    if warnings:
+        blocks.append(to_html(warnings_text(warnings)))
+    blocks.append("<i>Send /today for today's full workout, or /day fri for any day.</i>")
+    background = []
+    if plan["split_explanation"]:
+        background.append(f"🧠 <b>Why this split</b>\n{_h(plan['split_explanation'])}")
     if plan["notes"]:
-        blocks.append("<b>📝 Notes</b>\n<blockquote expandable>" + "\n".join(f"• {_h(n)}" for n in plan["notes"]) + "</blockquote>")
-    blocks.append("Send /today for today's full workout, or /day fri for any day.")
+        background.append("📝 <b>Notes</b>\n" + "\n".join(f"• {_h(n)}" for n in plan["notes"]))
+    if background:
+        blocks.append(f"{DIVIDER}\n<blockquote expandable>" + "\n\n".join(background) + "</blockquote>")
     return blocks
 
 
@@ -2225,18 +2269,49 @@ def html_to_plain(html_text: str) -> str:
     return _visible(text)
 
 
-ENTITY_RE = re.compile(r"<(?:b|i|u|s|code|pre|a|blockquote)[\s>]")
+ENTITY_RE = re.compile(r"<(?:b|i|u|s|code|pre|a|blockquote|tg-spoiler)[\s>]")
+TAG_RE = re.compile(r"<(/?)(?:b|i|u|s|code|pre|a|blockquote|tg-spoiler)\b[^>]*>")
+
+
+def _fits(text: str, limit: int) -> bool:
+    return (_tg_len(html_to_plain(text)) <= limit and len(text) <= 3 * limit
+            and len(ENTITY_RE.findall(text)) <= 90)
+
+
+def split_block(block: str, limit: int = 3800) -> list[str]:
+    """An oversized block cut at line ends that are outside every tag, so each piece is
+    valid HTML on its own. A tag spanning more than the limit stays whole (the plain
+    text fallback in send_blocks then splits it)."""
+    if _fits(block, limit):
+        return [block]
+    units, unit, depth = [], [], 0
+    for line in block.split("\n"):
+        unit.append(line)
+        depth += sum(-1 if close else 1 for close in TAG_RE.findall(line))
+        if depth <= 0:
+            units.append("\n".join(unit))
+            unit, depth = [], 0
+    if unit:
+        units.append("\n".join(unit))
+    pieces, current = [], ""
+    for u in units:
+        candidate = f"{current}\n{u}" if current else u
+        if current and not _fits(candidate, limit):
+            pieces.append(current)
+            candidate = u
+        current = candidate
+    return pieces + ([current] if current else [])
 
 
 def pack_blocks(blocks: list[str], limit: int = 3800) -> list[str]:
     """Join HTML blocks into messages under Telegram's length limit (and well under its
-    limit on formatted pieces per message)."""
+    limit on formatted pieces per message). Cuts only between blocks, or inside an
+    oversized block at a line outside every tag."""
     messages: list[str] = []
     current = ""
-    for block in blocks:
+    for block in (piece for b in blocks for piece in split_block(b, limit)):
         candidate = f"{current}\n\n{block}" if current else block
-        if (_tg_len(html_to_plain(candidate)) <= limit and len(candidate) <= 3 * limit
-                and len(ENTITY_RE.findall(candidate)) <= 90):
+        if _fits(candidate, limit):
             current = candidate
             continue
         if current:
@@ -2247,26 +2322,27 @@ def pack_blocks(blocks: list[str], limit: int = 3800) -> list[str]:
     return messages
 
 
-async def send_blocks(bot, chat_id: int, blocks: list[str], reply_markup=None) -> list:
-    """Send ready made HTML blocks; plain text if Telegram rejects the HTML."""
+async def send_blocks(bot, chat_id: int, blocks: list[str], reply_markup=None, thread: Any = ...) -> list:
+    """The one send path: HTML blocks packed into messages, and plain text if Telegram
+    rejects the HTML, so nothing is lost. thread overrides the BOT_CHAT topic."""
     sent = []
     messages = pack_blocks(blocks)
+    thread_id = topic(chat_id) if thread is ... else thread
     for i, message in enumerate(messages):
         markup = reply_markup if i == len(messages) - 1 else None
-        links = [html.unescape(href) for href in re.findall(r'href="([^"]+)"', message)]
-        video = next((link for link in links if VIDEO_LINK_RE.fullmatch(link)), None)
+        video = find_video_link(html_to_plain(message))
         preview = LinkPreviewOptions(url=video) if video else LinkPreviewOptions(is_disabled=True)
         try:
             msg = await bot.send_message(chat_id, message, parse_mode=ParseMode.HTML,
                                          link_preview_options=preview, reply_markup=markup,
-                                         message_thread_id=topic(chat_id))
+                                         message_thread_id=thread_id)
         except BadRequest as exc:
             log.warning("Telegram rejected the HTML (%s), sending plain text", exc)
             chunks = split_text(html_to_plain(message))
             for k, chunk in enumerate(chunks):
                 msg = await bot.send_message(chat_id, chunk, link_preview_options=preview,
                                              reply_markup=markup if k == len(chunks) - 1 else None,
-                                             message_thread_id=topic(chat_id))
+                                             message_thread_id=thread_id)
         sent.append(msg)
     return sent
 
@@ -2354,7 +2430,7 @@ class Coach:
         skipped = sum(1 for v in sessions if v.get("status") == "skipped")
         plan = self.store.load_plan(monday)
         planned = sum(1 for d in parse_plan(plan or "").days.values() if not d.is_rest) if plan else None
-        lines = ["**Last week in numbers**"]
+        lines = ["📊 **Last week in numbers**"]
         session_line = f"• Sessions: {done} done, {skipped} skipped"
         if planned:
             session_line += f" ({planned} training days planned)"
@@ -2944,13 +3020,13 @@ class Coach:
                 return None
         self.store.update_state(token_reminder={"created": created.isoformat(), "sent": today.isoformat()})
         steps = (
-            "On your computer run claude setup-token, put the new token in bot.env as "
-            "CLAUDE_CODE_OAUTH_TOKEN, set CLAUDE_TOKEN_CREATED to today's date, then run "
-            "docker compose up -d in the bot folder."
+            "On your computer run `claude setup-token`, put the new token in bot.env as "
+            "`CLAUDE_CODE_OAUTH_TOKEN`, set `CLAUDE_TOKEN_CREATED` to today's date, then run "
+            "`docker compose up -d` in the bot folder."
         )
         if left < 0:
-            return f"🔑 Your Claude Code token probably expired on {fmt_day(expires)}. {steps}"
-        return f"🔑 Your Claude Code token expires in {left} days, on {fmt_day(expires)}. {steps}"
+            return f"Your Claude Code token probably expired on {fmt_day(expires)}.\n\n{steps}"
+        return f"Your Claude Code token expires in {left} days, on {fmt_day(expires)}.\n\n{steps}"
 
     # -- views: workout cards for structured plans, text for older plans ------
 
@@ -2967,15 +3043,16 @@ class Coach:
         return lines
 
     def day_view(self, day: date, heading: str = "", notes: list[str] | None = None) -> list[str] | None:
-        """The day's workout card (HTML blocks), or None when the week has no structured plan."""
+        """The day's workout card (HTML blocks), or None when the week has no structured plan.
+        heading: a ready made header() line that goes on top."""
         monday = monday_of(day)
         data = self.store.load_plan_data(monday)
         entry = next((d for d in data["days"] if d["day"] == DAY_NAMES[day.weekday()]), None) if data else None
         if entry is None:
             return None
-        top = ([f"**{heading}**"] if heading else []) + self.day_status_lines(day) + (notes or [])
-        blocks = [to_html("\n".join(top))] if top else []
-        return blocks + day_card_blocks(entry, self.week_label(monday), day)
+        cards = day_card_blocks(entry, self.week_label(monday), day)
+        status = self.day_status_lines(day) + (notes or [])
+        return [heading] * bool(heading) + cards[:1] + ([to_html("\n".join(status))] if status else []) + cards[1:]
 
     def day_text(self, day: date) -> str:
         plan = self.store.load_plan(monday_of(day))
@@ -2993,8 +3070,12 @@ class Coach:
     def today_text(self) -> str:
         return self.day_text(self.today())
 
-    def today_view(self) -> str | list[str]:
-        return self.day_view(self.today()) or self.today_text()
+    def day_text_view(self, day: date) -> list[str]:
+        """A day from an older text plan (or no plan) as a card."""
+        return card("workout", fmt_day(day), self.day_text(day))
+
+    def today_view(self) -> list[str]:
+        return self.day_view(self.today()) or self.day_text_view(self.today())
 
     def upcoming(self, weekday: int) -> date:
         """That weekday this week, or next week's once it has passed and next week is built."""
@@ -3004,9 +3085,9 @@ class Coach:
             day += timedelta(days=7)
         return day
 
-    def any_day_view(self, weekday: int) -> str | list[str]:
+    def any_day_view(self, weekday: int) -> list[str]:
         day = self.upcoming(weekday)
-        return self.day_view(day) or self.day_text(day)
+        return self.day_view(day) or self.day_text_view(day)
 
     def week_to_show(self) -> tuple[date, str]:
         """This week's Monday, or next week's on weekends once it is built, plus a note."""
@@ -3031,73 +3112,57 @@ class Coach:
                 marks[DAY_NAMES[i]] = "✅" if status == "done" else "⏭"
         return marks
 
-    def week_view(self) -> str | list[str]:
+    def week_view(self) -> list[str]:
         monday, note = self.week_to_show()
         data = self.store.load_plan_data(monday)
         if not data:
             return self.week_text()
-        blocks = week_summary_blocks(data, self.week_label(monday), self.week_marks(monday))
-        if note:
-            blocks.insert(0, to_html(f"{note} Here is this week's plan until then."))
-        return blocks
+        return week_summary_blocks(data, self.week_label(monday), self.week_marks(monday),
+                                   note=f"{note} Here is this week's plan until then." if note else "")
 
-    def plan_view(self, result: PlanResult) -> str | list[str]:
+    def plan_view(self, result: PlanResult) -> list[str]:
         """The reply after /plan or /nextweek."""
         if not result.data:
             return self.plan_reply(result)
-        blocks = week_summary_blocks(result.data, self.week_label(result.monday))
-        if result.warnings:
-            blocks.insert(-1, to_html("⚠️ Please check:\n" + "\n".join(f"• {w}" for w in result.warnings)))
-        return blocks
+        return week_summary_blocks(result.data, self.week_label(result.monday), warnings=result.warnings)
 
-    def week_text(self) -> str:
+    def week_text(self) -> list[str]:
         monday, note = self.week_to_show()
         plan = self.store.load_plan(monday)
         if not plan:
-            return "No plan is saved for this week yet. Send /plan to build one." + (f" {note}" if note else "")
-        if note:
-            return f"{note.strip()} Here is this week's plan until then.\n\n**{self.week_label(monday)}**\n\n{plan.strip()}"
-        return f"**{self.week_label(monday)}**\n\n{plan.strip()}"
+            return card("week", "", "No plan is saved for this week yet. Send /plan to build one." + (f" {note}" if note else ""))
+        return card("week", self.week_label(monday), f"{note.strip()} Here is this week's plan until then." if note else "",
+                    plan.strip())
 
-    def rest_of_week(self, result: PlanResult, skipped: date) -> str:
-        text = self.overview(result, "Here is the rest of your week, adjusted:", start=skipped.weekday() + 1)
-        text += "\n\nSend /week for the full plan."
-        if result.warnings:
-            text += "\n\n⚠️ Please check:\n" + "\n".join(f"• {w}" for w in result.warnings)
-        return text
+    def rest_of_week(self, result: PlanResult, skipped: date) -> list[str]:
+        return card("week", "the rest of your week, adjusted", *self.overview(result, start=skipped.weekday() + 1),
+                    warnings_text(result.warnings), hint="Send /week for the full plan.")
 
-    def overview(self, result: PlanResult, heading: str, start: int = 0) -> str:
+    def overview(self, result: PlanResult, start: int = 0) -> list[str]:
+        """One light markdown block per day from `start`: focus and exercise names."""
+        blocks = []
         if result.data:
-            lines = [heading, ""]
             for day in result.data["days"]:
-                idx = DAY_LOOKUP[day["day"].lower()]
-                if idx < start:
+                if DAY_LOOKUP[day["day"].lower()] < start:
                     continue
-                lines.append(f"📅 {day['day'][:3]}: {day['focus']}")
+                lines = [f"📅 **{day['day'][:3]}** · {day['focus']}"]
                 for sec in day["sections"]:
                     names = ", ".join(ex["name"] for ex in sec["exercises"])
                     lines.append(f"{body_part_emoji(sec['body_part'])} {sec['body_part']}: {names}")
-                lines.append("")
-            return "\n".join(lines).strip()
+                blocks.append("\n".join(lines))
+            return blocks
         parsed = parse_plan(result.text)
-        lines = [heading, ""]
         for idx in range(start, 7):
             day = parsed.days.get(idx)
             if not day:
                 continue
             entries = [exercise_entry(l) for l in day.text.splitlines()[1:]]
             names = [f"{name} (rehab)" if rehab else name for name, rehab in filter(None, entries)]
-            lines.append(f"📅 {DAY_NAMES[idx][:3]}: {day.focus}")
-            if names:
-                lines.append(", ".join(names))
-            lines.append("")
-        return "\n".join(lines).strip()
+            blocks.append(f"📅 **{DAY_NAMES[idx][:3]}** · {day.focus}" + (f"\n🏋️ {', '.join(names)}" if names else ""))
+        return blocks
 
-    def plan_reply(self, result: PlanResult) -> str:
-        text = f"**{self.week_label(result.monday)}**\n\n{result.text.strip()}"
-        if result.warnings:
-            text += "\n\n⚠️ Please check:\n" + "\n".join(f"• {w}" for w in result.warnings)
-        return text
+    def plan_reply(self, result: PlanResult) -> list[str]:
+        return card("week", self.week_label(result.monday), result.text.strip(), warnings_text(result.warnings))
 
 
 # ---------------------------------------------------------------------------
@@ -3123,9 +3188,7 @@ COMMANDS = [
     ("whoami", "Your Telegram user ID"),
 ]
 
-HELP_TEXT = """Hi, I am your gym coach.
-
-• Just write to me, or use /coach, with any training question.
+HELP_TEXT = """• Just write to me, or use /coach, with any training question.
 • /today shows today's workout, /day fri any day's, and /week the whole week.
 • /plan rebuilds this week and /nextweek builds next week. Add notes after the command.
 • /log what you did, then /done when you finish a session.
@@ -3145,10 +3208,9 @@ def args_text(update: Update) -> str:
 
 
 async def send_view(bot, chat_id: int, view: str | list[str], reply_markup=None) -> list:
-    """Text goes through the Markdown to HTML path; a list is ready made HTML blocks."""
-    if isinstance(view, list):
-        return await send_blocks(bot, chat_id, view, reply_markup=reply_markup)
-    return await send_text(bot, chat_id, view, reply_markup=reply_markup)
+    """A list is ready made HTML blocks (card()); text is light markdown, escaped on the way."""
+    blocks = view if isinstance(view, list) else text_blocks(view)
+    return await send_blocks(bot, chat_id, blocks, reply_markup=reply_markup)
 
 
 async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str | list[str], reply_markup=None):
@@ -3183,23 +3245,20 @@ async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 if stamp - recent.get(user.id, 0) > 30:
                     recent[user.id] = stamp
                     log.info("Message from a user who is not allowed: %s", user.id)
-                    await context.bot.send_message(
-                        chat.id,
-                        f"Sorry, this is a private bot. Your Telegram user ID is <code>{user.id}</code>.",
-                        parse_mode=ParseMode.HTML,
-                    )
+                    await send_blocks(context.bot, chat.id, card(
+                        "private", "", f"Sorry, this is a private bot. Your Telegram user ID is `{user.id}`."))
     except Exception as exc:  # noqa: BLE001 - never let a failed reply open the gate
         log.warning("Could not answer a user who is not allowed: %s", exc)
     raise ApplicationHandlerStop
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await reply(update, context, HELP_TEXT)
+    await reply(update, context, card("help", "Hi, I am your gym coach", HELP_TEXT))
 
 
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    await reply(update, context, f"Your Telegram user ID is `{user.id}`.")
+    await reply(update, context, card("whoami", "", f"Your Telegram user ID is `{user.id}`."))
 
 
 async def answer_question(update: Update, context: ContextTypes.DEFAULT_TYPE, question: str) -> None:
@@ -3209,15 +3268,15 @@ async def answer_question(update: Update, context: ContextTypes.DEFAULT_TYPE, qu
         async with typing(context.bot, chat_id):
             answer = await coach.ask(chat_id, question)
     except ClaudeError as exc:
-        await reply(update, context, exc.user_message)
+        await reply(update, context, card("error", "", exc.user_message))
         return
-    await reply(update, context, answer)
+    await reply(update, context, card("coach", "", answer))
 
 
 async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     question = args_text(update)
     if not question:
-        await reply(update, context, "Send /ask followed by your question, for example: /ask I only have 30 minutes today")
+        await reply(update, context, card("coach", "", "Send /ask followed by your question, for example: /ask I only have 30 minutes today"))
         return
     await answer_question(update, context, question)
 
@@ -3229,7 +3288,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     saved = coach_of(context).capture_checkin(update.effective_message)
     if saved:
-        await reply(update, context, saved)
+        await reply(update, context, card("checkin", "saved", saved))
         return
     await answer_question(update, context, text)
 
@@ -3250,14 +3309,16 @@ async def cmd_log(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not text:
         logs = coach.store.logs(coach.today() - timedelta(days=13))
         if not logs:
-            await reply(update, context, "No logs in the last 2 weeks. Log a session like this:\n/log rows 22kg 3x10, floor press 14kg 3x8 felt easy")
+            await reply(update, context, card("log", "", "No logs in the last 2 weeks.",
+                                              hint="Log a session like this: /log rows 22kg 3x10, floor press 14kg 3x8 felt easy"))
             return
-        lines = [f"• {fmt_day(d)}: {r['text']}" for r in logs if (d := _row_date(r))]
-        await reply(update, context, "**Your logs from the last 2 weeks**\n\n" + "\n".join(lines))
+        items = [f"🏋️ **{fmt_day(d)}** · {r['text']}" for r in logs if (d := _row_date(r))]
+        await reply(update, context, card("log", "your logs from the last 2 weeks", "\n".join(items)))
         return
     now = coach.now()
     coach.store.add_log(now, text)
-    await reply(update, context, f"Logged for {fmt_day(now.date())}. Send /done when you finish the session.")
+    await reply(update, context, card("log", "saved", f"Logged for {fmt_day(now.date())}.",
+                                      hint="Send /done when you finish the session."))
 
 
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3270,26 +3331,26 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await reply(
         update,
         context,
-        f"✅ Nice work. Today's session is marked done.\n\n{RATING_QUESTION}",
+        card("done", fmt_day(now.date()), "Nice work. Today's session is marked done.", f"🩹 {RATING_QUESTION}"),
         reply_markup=rating_keyboard(now.date()),
     )
 
 
-def shoulder_log_text(coach: Coach) -> str:
+def shoulder_log_text(coach: Coach) -> list[str]:
     ratings = coach.store.ratings()
     if not ratings:
-        return "No shoulder ratings yet. You get the buttons after /done, or send /shoulder 3 to add one."
-    lines = ["**Left shoulder ratings** (0 = no pain, 10 = worst pain)", ""]
+        return card("shoulder", "", "No shoulder ratings yet. You get the buttons after /done, or send /shoulder 3 to add one.")
+    lines = []
     for r in ratings:
         d = _row_date(r)
         when = f"{d:%a} {d.day} {d:%b %Y}" if d else str(r.get("date"))
         note = f" ({r['note']})" if r.get("note") else ""
-        lines.append(f"{when}, {r.get('time', '')}: {r['rating']}/10{note}")
-    lines += ["", "Trend: " + coach.trend()]
+        lines.append(f"📅 {when}, {r.get('time', '')} · **{r['rating']}/10**{note}")
+    trend = "📈 **Trend** · " + coach.trend()
     spark = weekly_sparkline(ratings, coach.today())
     if spark:
-        lines.append(spark)
-    return "\n".join(lines)
+        trend += "\n" + spark
+    return card("shoulder", "ratings, 0 = no pain, 10 = worst pain", "\n".join(lines), trend)
 
 
 def shoulder_csv(coach: Coach) -> bytes:
@@ -3304,27 +3365,25 @@ def shoulder_csv(coach: Coach) -> bytes:
     return out.getvalue().encode("utf-8-sig")  # opens cleanly in Excel and Numbers
 
 
-def progress_text(coach: Coach) -> str:
+def progress_text(coach: Coach) -> list[str]:
     history = progress_history(coach.store.logs())
     if not history:
-        return (
-            "No weights in your logs yet. Log them like this and I will track them:\n"
-            "/log rows 22kg 3x10, floor press 14kg 3x8 felt easy"
-        )
-    lines = ["**Progress from your logs** (first → latest)"]
+        return card("progress", "", "No weights in your logs yet. Log them like this and I will track them:\n"
+                    "/log rows 22kg 3x10, floor press 14kg 3x8 felt easy")
+    items = []
     for _, entries in sorted(history.items(), key=lambda kv: kv[1][-1]["date"], reverse=True):
         first, last = entries[0], entries[-1]
         name = last["name"][:1].upper() + last["name"][1:]
         if first["kg"] is not None and last["kg"] is not None and len(entries) > 1:
             change = last["kg"] - first["kg"]
-            sign = "+" if change > 0 else ""
-            detail = f"{first['kg']:g} → {last['kg']:g} kg ({sign}{change:g} kg)"
+            marker = "🟢 ▲" if change > 0 else ("🔴 ▼" if change < 0 else "⚪ ")
+            detail = f"{first['kg']:g} → {last['kg']:g} kg {marker}{abs(change):g} kg"
         else:
             detail = _fmt_item(last)
         sets = f", last {last['sets']} x {last['reps']}" if last["sets"] and first["kg"] is not None and len(entries) > 1 else ""
         count = f"{len(entries)} session{'s' if len(entries) > 1 else ''}"
-        lines.append(f"• {name}: {detail}{sets} · {count}, latest {fmt_day(last['date'])}")
-    return "\n".join(lines)
+        items.append(f"🏋️ **{name}** · {detail}\n📅 {count}, latest {fmt_day(last['date'])}{sets}")
+    return card("progress", "from your logs, first → latest", *items)
 
 
 async def cmd_progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3332,7 +3391,7 @@ async def cmd_progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 def rating_feedback(coach: Coach, rating: int) -> str:
-    text = "Trend: " + coach.trend()
+    text = "📈 **Trend** · " + coach.trend()
     if rating >= 6 or shoulder_rising(coach.store.ratings(), coach.today()):
         text += (
             "\n\nThat is on the high side. Keep the left arm light and pain free, and check with "
@@ -3352,12 +3411,12 @@ async def cmd_shoulder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if arg:
         m = re.fullmatch(r"(\d{1,2})(?!\d|[.,]\d)(?:\s*/\s*10)?\s*[,.;:]?\s*(.*)", arg, re.DOTALL)
         if not m or int(m.group(1)) > 10:
-            await reply(update, context, "Send /shoulder on its own for your log, or /shoulder 3 to save a rating. Use a whole number from 0 to 10.")
+            await reply(update, context, card("shoulder", "", "Send /shoulder on its own for your log, or /shoulder 3 to save a rating. Use a whole number from 0 to 10."))
             return
         now = coach.now()
         rating = int(m.group(1))
         coach.store.add_rating(now.date(), now, rating, m.group(2).strip() or "manual")
-        await reply(update, context, f"Left shoulder {rating}/10 saved.\n\n" + rating_feedback(coach, rating))
+        await reply(update, context, card("shoulder", f"{rating}/10 saved", rating_feedback(coach, rating)))
         return
     await reply(update, context, shoulder_log_text(coach))
     if coach.store.ratings():
@@ -3383,8 +3442,9 @@ async def on_rate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     coach.store.add_rating(day, coach.now(), rating, "after session")
     await query.answer(f"Saved {rating}/10")
     with contextlib.suppress(BadRequest):
-        await query.edit_message_text(f"Left shoulder {rating}/10 saved for {fmt_day(day)}.")
-    await send_text(context.bot, query.message.chat.id, rating_feedback(coach, rating))
+        await query.edit_message_text(f"{header('shoulder', f'{rating}/10 saved')}\n\nFor {fmt_day(day)}.",
+                                      parse_mode=ParseMode.HTML)
+    await send_view(context.bot, query.message.chat.id, card("shoulder", f"{rating}/10", rating_feedback(coach, rating)))
 
 
 async def on_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3405,11 +3465,14 @@ async def on_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await query.answer()
     if answer == "done":
         with contextlib.suppress(BadRequest):
-            await query.edit_message_text(f"✅ {fmt_day(day)} marked as done. Nice work.")
-        await send_text(context.bot, chat_id, RATING_QUESTION, reply_markup=rating_keyboard(day))
+            await query.edit_message_text(f"{header('done', fmt_day(day))}\n\nMarked as done. Nice work.",
+                                          parse_mode=ParseMode.HTML)
+        await send_view(context.bot, chat_id, card("shoulder", "how does it feel?", RATING_QUESTION),
+                        reply_markup=rating_keyboard(day))
         return
     with contextlib.suppress(BadRequest):
-        await query.edit_message_text(f"⏭ {fmt_day(day)} marked as skipped.")
+        await query.edit_message_text(f"{header('skipped', fmt_day(day))}\n\nMarked as skipped.",
+                                      parse_mode=ParseMode.HTML)
     today = coach.today()
     if previous == "skipped" or monday_of(day) != monday_of(today) or max(day, today).weekday() >= 6:
         return
@@ -3417,15 +3480,15 @@ async def on_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if coach.store.sessions().get(day.isoformat(), {}).get("status") != "skipped":
         return  # changed to Done in the meantime
-    await send_text(context.bot, chat_id, "No problem. I am adjusting the rest of your week so you do not double up. This takes a minute or two.")
+    await send_view(context.bot, chat_id, card("plan", "adjusting your week", "No problem. I am adjusting the rest of your week so you do not double up. This takes a minute or two."))
     try:
         async with typing(context.bot, chat_id):
             result = await coach.adjust_after_skip(day)
     except ClaudeError as exc:
-        await send_text(context.bot, chat_id, f"I saved the skip but could not adjust the plan. {exc.user_message}")
+        await send_view(context.bot, chat_id, card("error", "plan", f"I saved the skip but could not adjust the plan. {exc.user_message}"))
         return
     if result:
-        await send_text(context.bot, chat_id, coach.rest_of_week(result, max(day, today)))
+        await send_view(context.bot, chat_id, coach.rest_of_week(result, max(day, today)))
 
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3436,7 +3499,7 @@ async def cmd_day(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     arg = args_text(update).lower().strip(" .")
     weekday = DAY_LOOKUP.get(arg)
     if weekday is None:
-        await reply(update, context, "Which day? Send /day and a day, like /day fri or /day monday.")
+        await reply(update, context, card("workout", "which day?", "Which day? Send /day and a day, like /day fri or /day monday."))
         return
     await reply(update, context, coach_of(context).any_day_view(weekday))
 
@@ -3449,18 +3512,19 @@ async def _build_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, m
     coach = coach_of(context)
     notes = args_text(update)
     chat_id = update.effective_chat.id
+    busy = card("plan", "busy", "I am already building a plan. I will send it when it is ready.")
     if coach.plan_lock.locked():
-        await reply(update, context, "I am already building a plan. I will send it when it is ready.")
+        await reply(update, context, busy)
         return
-    await reply(update, context, f"Building {label}. This usually takes a minute or two.")
+    await reply(update, context, card("plan", label, f"Building {label}. This usually takes a minute or two."))
     try:
         async with typing(context.bot, chat_id):
             result = await coach.build_week(monday, notes, kind="rebuild" if coach.store.load_plan(monday) else "build")
     except PlanBusy:
-        await reply(update, context, "I am already building a plan. I will send it when it is ready.")
+        await reply(update, context, busy)
         return
     except ClaudeError as exc:
-        await reply(update, context, f"I could not build the plan. {exc.user_message}")
+        await reply(update, context, card("error", "plan", f"I could not build the plan. {exc.user_message}"))
         return
     await reply(update, context, coach.plan_view(result))
 
@@ -3480,38 +3544,38 @@ async def cmd_injury(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     new = args_text(update)
     if not new:
         text, updated = coach.injury_text()
-        when = f" (updated {updated[:10]})" if updated else " (from bot.env)"
+        when = f"updated {updated[:10]}" if updated else "from bot.env"
         if text.strip():
-            await reply(update, context, f"**Injury notes**{when}\n\n{text}\n\nReplace them with /injury <new notes>, or clear them with /injury none.")
+            await reply(update, context, card("injury", when, text,
+                                              hint="Replace them with /injury <new notes>, or clear them with /injury none."))
         else:
-            await reply(update, context, f"No injury notes are saved{when}. Add some with /injury <notes>.")
+            await reply(update, context, card("injury", when, "No injury notes are saved.",
+                                              hint="Add some with /injury <notes>."))
         return
     if new.lower() in ("none", "clear", "no", "-"):
         coach.store.set_injury("", coach.now())
-        await reply(update, context, "Injury notes cleared.")
+        await reply(update, context, card("injury", "cleared", "Injury notes cleared."))
         return
     coach.store.set_injury(new, coach.now())
-    await reply(update, context, "Injury notes saved. The coach will use them from now on.")
+    await reply(update, context, card("injury", "saved", "Injury notes saved. The coach will use them from now on."))
 
 
-def away_text(coach: Coach) -> str:
+def away_text(coach: Coach) -> list[str]:
     today = coach.today()
     periods = [p for p in coach.store.away() if p["end"] >= today.isoformat()]
-    lines = []
-    if periods:
-        lines.append("**Days away**")
-        for p in periods:
-            start, end = date.fromisoformat(p["start"]), date.fromisoformat(p["end"])
-            span = fmt_day(start) if start == end else f"{fmt_day(start)} to {fmt_day(end)}"
-            lines.append(f"• {span}" + (f" ({p['note']})" if p.get("note") else ""))
-    else:
-        lines.append("No days away saved.")
+    parts = []
+    for p in periods:
+        start, end = date.fromisoformat(p["start"]), date.fromisoformat(p["end"])
+        span = fmt_day(start) if start == end else f"{fmt_day(start)} to {fmt_day(end)}"
+        parts.append(f"✈️ **{span}**" + (f" · {p['note']}" if p.get("note") else ""))
+    if not periods:
+        parts.append("No days away saved.")
     holidays_ahead = [(d, label) for d, label in coach.days_off(today, today + timedelta(days=60)) if label.startswith("public")]
     if holidays_ahead:
-        lines += ["", "**Public holidays in the next 60 days**"]
-        lines += [f"• {fmt_day(d)}: {label.removeprefix('public holiday (').rstrip(')')}" for d, label in holidays_ahead]
-    lines += ["", "Add days like this: /away 8 Oct to 10 Oct Bangkok trip, or /away thu fri. Clear them with /away clear."]
-    return "\n".join(lines)
+        parts.append("🎌 **Public holidays in the next 60 days**\n" + "\n".join(
+            f"• {fmt_day(d)}: {label.removeprefix('public holiday (').rstrip(')')}" for d, label in holidays_ahead))
+    return card("away", "", *parts,
+                hint="Add days like this: /away 8 Oct to 10 Oct Bangkok trip, or /away thu fri. Clear them with /away clear.")
 
 
 async def cmd_away(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3523,12 +3587,12 @@ async def cmd_away(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if arg.lower() in ("clear", "none", "cancel"):
         coach.store.set_away([p for p in coach.store.away() if p["end"] < today.isoformat()])
-        await reply(update, context, "Days away cleared.")
+        await reply(update, context, card("away", "cleared", "Days away cleared."))
         return
     try:
         start, end, note = parse_away(arg, today)
     except ValueError:
-        await reply(update, context, "I could not read those dates. Try /away 8 Oct to 10 Oct Bangkok trip, /away thu fri, or /away tomorrow hotel gym only.")
+        await reply(update, context, card("away", "", "I could not read those dates. Try /away 8 Oct to 10 Oct Bangkok trip, /away thu fri, or /away tomorrow hotel gym only."))
         return
     periods = [p for p in coach.store.away() if p["end"] >= today.isoformat()]
     periods.append({"start": start.isoformat(), "end": end.isoformat(), "note": note})
@@ -3540,22 +3604,22 @@ async def cmd_away(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text += " This week's plan was built before, so send /plan to rebuild it with a hotel gym or bodyweight version on those days."
     else:
         text += " The plan for that week will use a hotel gym or bodyweight version on those days."
-    await reply(update, context, text)
+    await reply(update, context, card("away", "saved", text))
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     coach_of(context).store.clear_memory(update.effective_chat.id)
-    await reply(update, context, "Chat memory cleared.")
+    await reply(update, context, card("memory", "", "Chat memory cleared."))
 
 
-def profile_text(coach: Coach) -> str:
+def profile_text(coach: Coach) -> list[str]:
     cfg = coach.cfg
     today = coach.today()
     monday = monday_of(today)
     week = coach.week_number(monday)
     injury, updated = coach.injury_text()
     lines = [
-        "**About you**",
+        "🧍 **About you**",
         f"• Age {cfg.age}, height {_with_unit(cfg.height_cm, 'cm')}, weight {_with_unit(cfg.weight_kg, 'kg')}",
         f"• Goal: {cfg.goal}",
         f"• Experience: {cfg.experience}",
@@ -3564,17 +3628,17 @@ def profile_text(coach: Coach) -> str:
         f"• Gym times: {cfg.gym_time_mon_thu} Monday to Thursday, {cfg.gym_time_fri} Friday",
         f"• Basketball: {join_names([DAY_NAMES[d] for d in cfg.basketball_days]) or 'no fixed day'}",
         "",
-        "**Programme**",
+        "🗓 **Programme**",
         f"• This week: {coach.week_label(monday)}",
         f"• Equipment rotation: {', '.join(cfg.equipment_rotation)}",
         f"• Programme started: {coach.program_start() or 'not yet, send /plan'}",
         "• Split this week: " + coach.split_text(monday).replace("\n", ", "),
         "",
-        "**Injury notes**" + (f" (updated {updated[:10]})" if updated else ""),
+        "🤕 **Injury notes**" + (f" · updated {updated[:10]}" if updated else ""),
         injury.strip() or "none",
     ]
     lines += coach_profile_extra(coach)
-    return "\n".join(lines)
+    return card("profile", "what the coach knows about you", "\n".join(lines))
 
 
 def coach_profile_extra(coach: Coach) -> list[str]:
@@ -3583,16 +3647,16 @@ def coach_profile_extra(coach: Coach) -> list[str]:
     week = coach.week_sessions_text(monday_of(today))
     lines = [
         "",
-        "**Left shoulder**",
+        "🩹 **Left shoulder**",
         coach.trend(),
         "",
-        "**Training**",
+        "🏋️ **Training**",
         f"• This week: {week or 'nothing marked done or skipped yet'}",
         f"• Workout logs in the last 2 weeks: {len(logs)}",
     ]
     garmin = coach.garmin_profile_line(today)
     if garmin:
-        lines += ["", "**Garmin**", garmin]
+        lines += ["", "⌚ **Garmin**", garmin]
     return lines
 
 
@@ -3609,8 +3673,8 @@ async def status_text(coach: Coach, application: Application) -> str:
     signed_in, auth = await coach.runner.auth_status()
     cfg = coach.cfg
     lines = [
-        "**Claude Code**",
-        f"• Version: {version}",
+        "🤖 **Claude Code**",
+        f"• Version: `{version}`",
         f"• Sign in: {'✅ ' if signed_in else '⚠️ '}{auth}",
         f"• Models: questions {cfg.model_ask}, plans {cfg.model_plan}",
     ]
@@ -3630,7 +3694,7 @@ async def status_text(coach: Coach, application: Application) -> str:
     else:
         lines.append("• Token date: set CLAUDE_TOKEN_CREATED in bot.env to get a renewal reminder")
     last = coach.store.state().get("last_plan_built")
-    lines += ["", "**Plans**"]
+    lines += ["", "🗓 **Plans**"]
     if last:
         built = datetime.fromisoformat(last["at"])
         lines.append(f"• Last plan built {fmt_when(built)} for the week of {fmt_day(date.fromisoformat(last['monday']))}")
@@ -3638,7 +3702,7 @@ async def status_text(coach: Coach, application: Application) -> str:
         lines.append("• No plan built yet. Send /plan")
     lines.append(f"• This week: {coach.week_label(monday_of(coach.today()))}")
     jobs = application.job_queue.jobs() if application.job_queue else ()
-    lines += ["", "**Next reminders**"]
+    lines += ["", "⏰ **Next reminders**"]
     upcoming = sorted(
         ((when, JOB_LABELS[job.name]) for job in jobs if job.name in JOB_LABELS and (when := job_next(job))),
         key=lambda item: item[0],
@@ -3661,11 +3725,11 @@ async def status_text(coach: Coach, application: Application) -> str:
 def status_extra(coach: Coach) -> list[str]:
     summary = coach.garmin_summary(coach.today())
     icon = "✅" if summary.ok else "⚠️"
-    lines = ["", "**Garmin**", f"• {icon} Profile {coach.cfg.garmin_profile}: {summary.short}"]
+    lines = ["", "⌚ **Garmin**", f"• {icon} Profile {coach.cfg.garmin_profile}: {summary.short}"]
     health = coach.store.read_json("health.json", {})
     now = coach.now()
     starts = [t for t in health.get("starts", []) if now - datetime.fromisoformat(t) < timedelta(days=7)]
-    lines += ["", "**Self repair**"]
+    lines += ["", "🛠 **Self repair**"]
     if health.get("started_at"):
         lines.append(f"• Running since {fmt_when(datetime.fromisoformat(health['started_at']))}, "
                      f"{len(starts)} start{'s' if len(starts) != 1 else ''} in the last 7 days")
@@ -3681,11 +3745,11 @@ def status_extra(coach: Coach) -> list[str]:
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     async with typing(context.bot, update.effective_chat.id):
         text = await status_text(coach_of(context), context.application)
-    await reply(update, context, text)
+    await reply(update, context, card("status", "Claude Code, sign in and reminders", text))
 
 
 async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await reply(update, context, "I do not know that command.\n\n" + HELP_TEXT)
+    await reply(update, context, card("help", "I do not know that command", HELP_TEXT))
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3699,11 +3763,8 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.error("Unhandled error", exc_info=error)
     if isinstance(update, Update) and update.effective_chat:
         with contextlib.suppress(Exception):
-            await context.bot.send_message(
-                update.effective_chat.id,
-                "Sorry, something went wrong on my side. I am looking into it and will tell you what I find.",
-                message_thread_id=topic(update.effective_chat.id),
-            )
+            await send_blocks(context.bot, update.effective_chat.id, card(
+                "error", "", "Sorry, something went wrong on my side. I am looking into it and will tell you what I find."))
     repair = getattr(context, "application", None) and context.application.bot_data.get("repair")
     if repair and error is not None:
         job = getattr(context, "job", None)
@@ -3902,10 +3963,10 @@ class SelfRepair:
         health["diagnoses_today"] = count
         seen[sig] = now.isoformat(timespec="seconds")
         self.save_health(health)
-        head = f"🩺 **Self repair**\nSomething went wrong in {where} ({type(error).__name__})."
+        head = f"Something went wrong in {where} ({type(error).__name__})."
         if not self.coach.cfg.self_repair:
             self.record(now, where, sig, "none", "")
-            await self.notify(f"{head}\nThe details are saved in data/errors.jsonl.")
+            await self.notify(card("repair", where, head, hint="The details are saved in data/errors.jsonl."))
             return
         try:
             result = await self.diagnose(error, where)
@@ -3918,17 +3979,15 @@ class SelfRepair:
                 reason = f"that failed too ({type(exc).__name__})."
                 log.exception("The self repair diagnosis failed")
             self.record(now, where, sig, "none", "")
-            await self.notify(f"{head}\nI could not ask Claude to look at it: {reason} "
-                                       "The details are saved in data/errors.jsonl.")
+            await self.notify(card("repair", where, head, f"I could not ask Claude to look at it: {reason}",
+                                   hint="The details are saved in data/errors.jsonl."))
             return
         done, restart = await self.apply(result, job)
         self.record(now, where, sig, result["remedy"], result.get("diagnosis", ""))
-        text = f"{head}\n**What Claude found:** {result.get('diagnosis', '').strip()}\n**What I did:** {done}"
-        if result.get("message", "").strip():
-            text += f"\n\n{result['message'].strip()}"
-        blocks = [to_html(text)]
+        blocks = card("repair", where, head, f"🔍 **What Claude found** · {result.get('diagnosis', '').strip()}\n"
+                      f"🔧 **What I did** · {done}", result.get("message", "").strip())
         if result.get("code_fix", "").strip():  # for a programmer, so it stays folded
-            blocks.append("<b>🛠 Suggested code change</b> <i>for the next update, tap to open</i>\n"
+            blocks.append(f"{DIVIDER}\n🧑‍💻 <b>Suggested code change</b> · <i>for the next update, tap to open</i>\n"
                           f"<blockquote expandable>{_h(result['code_fix'].strip()[:1500])}</blockquote>")
         await self.notify(blocks)
         if restart:
@@ -3943,10 +4002,9 @@ class SelfRepair:
         target = self.coach.cfg.repair_alert_chat
         if target is None or target == self.coach.cfg.bot_chat:  # owner_send already put it there
             return
-        body = "\n\n".join(view) if isinstance(view, list) else to_html(view)
+        blocks = view if isinstance(view, list) else text_blocks(view)
         try:
-            await self.ctx.bot.send_message(target[0], f"<b>gym-coach-bot</b>\n{body}"[:4096],
-                                            parse_mode=ParseMode.HTML, message_thread_id=target[1])
+            await send_blocks(self.ctx.bot, target[0], ["🏋️ <b>gym-coach-bot</b>", *blocks], thread=target[1])
         except Exception as exc:  # noqa: BLE001 - the owner already has it
             log.warning("Could not copy the self repair alert to REPAIR_ALERT_CHAT: %s", exc)
 
@@ -4071,16 +4129,16 @@ async def job_self_check(context: ContextTypes.DEFAULT_TYPE) -> None:
         told[key] = today
     repair.save_health(health)
     if new:
-        await owner_send(context, "\n\n".join(text for _, text in new))
+        await owner_send(context, card("selfcheck", "", *(text for _, text in new)))
 
 
 async def job_restart_notice(context: ContextTypes.DEFAULT_TYPE) -> None:
     """After an unexpected stop, tell the owner the bot is back and why it stopped."""
     reason = (context.job.data or {}).get("reason") if context.job else None
-    text = "♻️ I restarted after an unexpected stop"
+    text = "I restarted after an unexpected stop"
     text += f" ({reason})." if reason else ", possibly a crash, a memory limit or a NAS restart."
     text += " I am running again, and anything I missed is being caught up."
-    await owner_send(context, text)
+    await owner_send(context, card("restart", "", text))
 
 
 def mark_start(store: Store, now: datetime) -> dict | None:
@@ -4173,9 +4231,7 @@ JOB_LABELS = {
     "token_check": "Token expiry check",
 }
 
-CHECKIN_TEXT = """🗓 Weekly check in
-
-How did this week go? Tell me about:
+CHECKIN_TEXT = """How did this week go? Tell me about:
 • your energy
 • any soreness
 • your left shoulder, from 0 (no pain) to 10 (worst pain)
@@ -4219,15 +4275,16 @@ def alt_keyboard(day: date) -> InlineKeyboardMarkup:
 
 async def job_daily_workout(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Every morning: that day's workout, or that it is a rest day."""
-    await send_day_session(context, "☀️ Good morning. Today's workout", "☀️ Good morning. Rest day today.")
+    await send_day_session(context, header("morning", "Today's workout"), header("morning", "Rest day today"))
 
 
 async def job_session_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Today's session before the gym."""
-    await send_day_session(context, "🏋️ Today's session", "Rest day today.")
+    await send_day_session(context, header("session"), header("session", "Rest day today"))
 
 
 async def send_day_session(context: ContextTypes.DEFAULT_TYPE, heading: str, rest_heading: str) -> None:
+    """heading / rest_heading: header() lines for a training day / a rest day."""
     coach = coach_of(context)
     today = coach.today()
     monday = monday_of(today)
@@ -4235,7 +4292,7 @@ async def send_day_session(context: ContextTypes.DEFAULT_TYPE, heading: str, res
         return
     if not coach.store.load_plan(monday):
         if not coach.program_start():
-            await owner_send(context, "No training plan yet. Send /plan to build your first week.")
+            await owner_send(context, card("plan", "", "No training plan yet. Send /plan to build your first week."))
             return
         if coach.program_start() > monday:
             return  # the programme starts next week (first plan built with /nextweek)
@@ -4244,7 +4301,7 @@ async def send_day_session(context: ContextTypes.DEFAULT_TYPE, heading: str, res
         try:
             await coach.build_week(monday, kind="build", wait=True, keep_if=lambda meta: True)
         except ClaudeError as exc:
-            await owner_send(context, f"This week has no plan and I could not build one. {exc.user_message} Send /plan to try again.")
+            await owner_send(context, card("error", "plan", f"This week has no plan and I could not build one. {exc.user_message} Send /plan to try again."))
             return
     day = parse_plan(coach.store.load_plan(monday) or "").days.get(today.weekday())
     rest = bool(day and day.is_rest)
@@ -4255,18 +4312,14 @@ async def send_day_session(context: ContextTypes.DEFAULT_TYPE, heading: str, res
         return
     markup = None
     if day is None:
-        text = coach.today_text()
-    elif day.is_rest:
-        text = f"{rest_heading}\n\n{day.text}"
+        blocks = [heading, *text_blocks(coach.today_text())]
     else:
-        text = f"{heading}\n\n{day.text}"
-        markup = alt_keyboard(today)
-    off = coach.day_off_line(today)
-    if off and day is not None:
-        text = f"{off}\n{text}"
+        off = coach.day_off_line(today)
+        blocks = [rest_heading if day.is_rest else heading, *([to_html(off)] if off else []), *text_blocks(day.text)]
+        markup = None if day.is_rest else alt_keyboard(today)
     if note:
-        text += "\n\n" + note
-    await owner_send(context, text, reply_markup=markup)
+        blocks.append(to_html(note))
+    await owner_send(context, blocks, reply_markup=markup)
 
 
 async def on_alt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4301,14 +4354,14 @@ async def _answer_alt(update, context, coach, day, kind) -> None:
         async with typing(context.bot, chat_id):
             result = await coach.alt_session(day, kind)
     except ClaudeError as exc:
-        await reply(update, context, exc.user_message)
+        await reply(update, context, card("error", "", exc.user_message))
         return
     if result:
         new, question, warnings = result
         label = "⏱ 30 minute version" if kind == "short" else "🪶 Lighter version"
         blocks = day_card_blocks(new, f"{label} of today's session", day)
         if warnings:
-            blocks.insert(-1, to_html("⚠️ Please check:\n" + "\n".join(f"• {w}" for w in warnings)))
+            blocks.insert(-1, to_html(warnings_text(warnings)))
         await send_blocks(context.bot, chat_id, blocks)
         text = plan_to_text({"split_explanation": "", "days": [new], "notes": []})
         coach.store.add_memory(chat_id, question, text[:3000], coach.now())  # for follow up questions
@@ -4356,12 +4409,14 @@ async def job_evening_check(context: ContextTypes.DEFAULT_TYPE) -> None:
         seen = ", ".join(f"a {w['minutes']} min {w['type'].replace('_', ' ')} session" for w in workouts)
         await owner_send(
             context,
-            f"✅ Your watch shows {seen} today, so I marked today as done.\n\n{RATING_QUESTION}",
+            card("done", "from your watch", f"Your watch shows {seen} today, so I marked today as done.",
+                 f"🩹 {RATING_QUESTION}"),
             reply_markup=rating_keyboard(today),
         )
         return
     focus = f" ({day.focus})" if day else ""
-    await owner_send(context, f"Did you train today{focus}?", reply_markup=check_keyboard(today))
+    await owner_send(context, card("evening", fmt_day(today), f"Did you train today{focus}?"),
+                     reply_markup=check_keyboard(today))
 
 
 async def job_checkin(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4370,7 +4425,7 @@ async def job_checkin(context: ContextTypes.DEFAULT_TYPE) -> None:
     if before_programme(coach, monday_of(now.date()) + timedelta(days=7)):
         return
     until = datetime.combine(now.date(), coach.cfg.plan_time, tzinfo=coach.cfg.tz)
-    sent = await owner_send(context, CHECKIN_TEXT.format(until=f"{coach.cfg.plan_time:%H:%M}"))
+    sent = await owner_send(context, card("checkin", "", CHECKIN_TEXT.format(until=f"{coach.cfg.plan_time:%H:%M}")))
     if sent:
         coach.store.update_state(
             checkin={
@@ -4405,18 +4460,17 @@ async def build_next_week(context: ContextTypes.DEFAULT_TYPE, monday: date) -> N
     try:
         result = await coach.build_week(monday, notes, kind="scheduled", wait=True, keep_if=keep)
     except ClaudeError as exc:
-        await owner_send(context, f"I could not build next week's plan. {exc.user_message} Send /nextweek to try again.")
+        await owner_send(context, card("error", "plan", f"I could not build next week's plan. {exc.user_message} Send /nextweek to try again."))
         return
-    heading = "🗓 Next week's plan was already built" if result.reused else "🗓 Next week is ready"
-    text = coach.overview(result, f"{heading}. {coach.week_label(monday)}")
-    text += "\n\n" + coach.week_in_numbers(monday - timedelta(days=7))
-    text += "\n\nLeft shoulder: " + coach.trend()
-    if not coach.store.load_checkin(sunday):
-        text += "\n\nI did not get a check in answer this week, so I built it without one."
-    if result.warnings:
-        text += "\n\n⚠️ Please check:\n" + "\n".join(f"• {w}" for w in result.warnings)
-    text += "\n\nSend /week to see the full plan."
-    await owner_send(context, text)
+    heading = "Next week's plan was already built." if result.reused else "Next week is ready."
+    blocks = card("nextweek", coach.week_label(monday), heading, *coach.overview(result),
+                  warnings_text(result.warnings),
+                  "I did not get a check in answer this week, so I built it without one."
+                  if not coach.store.load_checkin(sunday) else "",
+                  hint="Send /week to see the full plan.",
+                  background=coach.week_in_numbers(monday - timedelta(days=7))
+                  + "\n\n🩹 **Left shoulder** · " + coach.trend())
+    await owner_send(context, blocks)
 
 
 async def job_weekly_plan(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4436,7 +4490,7 @@ def beat() -> None:
 async def job_token_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     text = coach_of(context).token_reminder()
     if text:
-        await owner_send(context, text)
+        await owner_send(context, card("token", "renew it", text))
 
 
 async def job_catch_up(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4454,22 +4508,19 @@ async def job_catch_up(context: ContextTypes.DEFAULT_TYPE) -> None:
             await job_checkin(context)
             return
         if now.time() >= cfg.plan_time and not coach.store.load_plan(monday + timedelta(days=7)):
-            await owner_send(context, "I was offline at plan time, so I am building next week's plan now.")
+            await owner_send(context, card("plan", "catching up", "I was offline at plan time, so I am building next week's plan now."))
             await build_next_week(context, monday + timedelta(days=7))
             return
     start = coach.program_start()
     if today.weekday() <= 4 and not coach.store.load_plan(monday) and start and start <= monday:
-        await owner_send(context, "I was offline when this week's plan was due, so I am building it now.")
+        await owner_send(context, card("plan", "catching up", "I was offline when this week's plan was due, so I am building it now."))
         try:
             result = await coach.build_week(monday, kind="build", wait=True, keep_if=lambda meta: True)
         except ClaudeError as exc:
-            await owner_send(context, f"I could not build this week's plan. {exc.user_message} Send /plan to try again.")
+            await owner_send(context, card("error", "plan", f"I could not build this week's plan. {exc.user_message} Send /plan to try again."))
             return
-        await owner_send(
-            context,
-            coach.overview(result, f"🗓 This week's plan. {coach.week_label(monday)}")
-            + "\n\nSend /today or /week for the details.",
-        )
+        await owner_send(context, card("week", f"this week · {coach.week_label(monday)}", *coach.overview(result),
+                                       hint="Send /today or /week for the details."))
 
 
 def schedule_jobs(application: Application) -> None:

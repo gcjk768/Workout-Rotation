@@ -31,7 +31,7 @@ async def test_daily_workout_every_morning(app, claude, clock, cfg):
     clock.set(2026, 10, 1, 7, 0)  # Thursday
     await bot.job_daily_workout(ctx(app))
     sent = app.tg.sent()[-1]
-    assert sent["text"].startswith("☀️ Good morning. Today's workout\n\n📅 Thursday: Upper body and rehab")
+    assert sent["text"].startswith("☀️ <b>GOOD MORNING</b> · Today's workout\n\n📅 Thursday: Upper body and rehab")
     assert keyboard_data(sent) == ["alt:2026-10-01:light", "alt:2026-10-01:short"]
 
 
@@ -40,7 +40,7 @@ async def test_daily_workout_on_a_rest_day(app, claude, clock):
     clock.set(2026, 10, 4, 7, 0)  # Sunday is a rest day in the fake plan
     await bot.job_daily_workout(ctx(app))
     sent = app.tg.sent()[-1]
-    assert sent["text"].startswith("☀️ Good morning. Rest day today.\n\n📅 Sunday: Rest")
+    assert sent["text"].startswith("☀️ <b>GOOD MORNING</b> · Rest day today\n\n📅 Sunday: Rest")
     assert keyboard_data(sent) == []
 
 
@@ -149,7 +149,7 @@ async def test_future_programme_start_blocks_sunday_jobs_and_checks(env, clock, 
 
 async def test_shoulder_rating_with_a_note(app):
     texts = await send(app, "/shoulder 4, sore after bench")
-    assert texts[0].startswith("Left shoulder 4/10 saved.")
+    assert texts[0].startswith("🩹 <b>LEFT SHOULDER</b> · 4/10 saved")
     assert app.bot_data["coach"].store.ratings()[0]["note"] == "sore after bench"
     assert "whole number" in (await send(app, "/shoulder 3,5"))[0]
 

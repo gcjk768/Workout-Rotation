@@ -180,15 +180,16 @@ async def test_today_is_a_workout_card_grouped_by_body_part(app, claude, clock):
     messages = html_messages(app, before)
     assert_telegram_accepts(messages)
     text = "\n\n".join(m["text"] for m in messages)
-    assert text.startswith("<b>📅 Wednesday 30 Sep · Legs and core</b>\n<i>Week 1 · dumbbells")
+    assert text.startswith("📅 <b>WEDNESDAY 30 SEP</b> · Legs and core\n<i>Week 1 · dumbbells")
     assert "⏱ About 55 min · 🎯 Chest, Arms, Shoulder rehab · 7 sets" in text
-    assert "<b>🔥 WARM UP</b>\n• 5 minutes easy bike" in text
-    assert "<b>🫸 CHEST</b>\n\n<b>1 · Dumbbells move W1 D3 N1</b>\n<code>3 × 10</code> · <b>12.5 kg</b> · rest 1 min 30 s · RPE 7" in text
-    assert "<b>🩹 SHOULDER REHAB</b> <i>(confirm with your physio)</i>" in text
+    assert "🔥 <b>Warm up</b>\n• 5 minutes easy bike" in text
+    assert ("━━━━━━━━━━━━━━━━\n🫸 <b>CHEST</b>\n\n🫸 <b>1 · Dumbbells move W1 D3 N1</b> · <code>3 × 10</code> @ <b>12.5 kg</b>\n"
+            "⏸ rest 1 min 30 s · RPE 7") in text
+    assert "🩹 <b>SHOULDER REHAB</b> · <i>confirm with your physio</i>" in text
     assert "<blockquote expandable>💡 Elbows &lt; 45 degrees, ribs down\n🦾 Left arm: Light, 5 kg, stop if it hurts" in text
     assert '▶️ <a href="https://www.youtube.com/results?search_query=Band+external+rotation+proper+form">' in text
     assert "🎯 chest &amp; front delts\n🐢 Tempo 3-1-1\n🔁 Swap: Push up on the bench</blockquote>" in text
-    assert "<b>🧊 COOL DOWN</b>" in text and text.endswith("send /done when you finish.")
+    assert "🧊 <b>Cool down</b>" in text and text.endswith("send /done when you finish.</i>")
     for m in messages:  # search links get no preview
         preview = m["link_preview_options"]
         assert (json.loads(preview) if isinstance(preview, str) else preview)["is_disabled"] is True
@@ -201,12 +202,12 @@ async def test_day_command_shows_any_day(app, claude, clock):
     messages = html_messages(app, before)
     assert_telegram_accepts(messages)
     text = "\n\n".join(m["text"] for m in messages)
-    assert text.startswith("<b>📅 Friday 2 Oct · Legs and run, or swim</b>")
-    assert "<b>🏊 SWIM</b>" in text and "<b>🦵 LEGS (IF YOU DO NOT SWIM)</b>" in text and "<b>🏃 RUN</b>" in text
+    assert text.startswith("📅 <b>FRIDAY 2 OCT</b> · Legs and run, or swim")
+    assert "🏊 <b>SWIM</b>" in text and "🦵 <b>LEGS (IF YOU DO NOT SWIM)</b>" in text and "🏃 <b>RUN</b>" in text
     assert "<b>A1 · Dumbbells move W1 D5 N1</b>" in text and "<b>A2 · Dumbbells move W1 D5 N2</b>" in text
-    assert "<code>1 × 3 km</code> · <b>6:00 per km</b>" in text
-    assert (await send(app, "/day someday"))[-1].startswith("Which day?")
-    assert (await send(app, "/day"))[-1].startswith("Which day?")
+    assert "<code>1 × 3 km</code> @ <b>6:00 per km</b>" in text
+    assert "Which day?" in (await send(app, "/day someday"))[-1]
+    assert "Which day?" in (await send(app, "/day"))[-1]
 
 
 async def test_day_command_looks_ahead_on_weekends(app, claude, clock):
@@ -214,9 +215,9 @@ async def test_day_command_looks_ahead_on_weekends(app, claude, clock):
     clock.set(2026, 10, 3, 12, 0)  # Saturday
     await send(app, "/nextweek")
     replies = await send(app, "/day mon")
-    assert replies[0].startswith("<b>📅 Monday 5 Oct")
+    assert replies[0].startswith("📅 <b>MONDAY 5 OCT")
     replies = await send(app, "/day sun")
-    assert replies[0].startswith("<b>📅 Sunday 4 Oct")
+    assert replies[0].startswith("📅 <b>SUNDAY 4 OCT")
 
 
 async def test_week_is_a_short_summary_by_body_part(app, claude, clock):
@@ -227,12 +228,13 @@ async def test_week_is_a_short_summary_by_body_part(app, claude, clock):
     messages = html_messages(app, before)
     assert_telegram_accepts(messages)
     text = "\n\n".join(m["text"] for m in messages)
-    assert text.startswith("<b>🗓 Week 1 · dumbbells")
-    assert "<b>📅 Wednesday · Legs and core</b> ✅ · ⏱ 55 min" in text
+    assert text.startswith("🗓 <b>WEEK PLAN</b> · Week 1 · dumbbells")
+    assert "📅 <b>Wednesday</b> · Legs and core ✅ · ⏱ 55 min" in text
     assert "🫸 <b>Chest</b>: Dumbbells move W1 D3 N1 3×10 @ 12.5 kg" in text
     assert "🏃 <b>Run</b>: Easy run 1×3 km" in text  # no @ for a pace without kg
     assert "🧘 <b>Mobility</b>: Cat cow 2×10" in text
-    assert text.endswith("Send /today for today's full workout, or /day fri for any day.")
+    assert "<i>Send /today for today's full workout, or /day fri for any day.</i>" in text
+    assert text.endswith("</blockquote>") and "📝 <b>Notes</b>" in text  # background folded at the end
 
 
 async def test_plan_reply_is_the_summary_with_warnings(app, claude, clock):
@@ -242,8 +244,8 @@ async def test_plan_reply_is_the_summary_with_warnings(app, claude, clock):
     before = len(app.tg.sent())
     await send(app, "/plan")
     text = "\n\n".join(m["text"] for m in html_messages(app, before))
-    assert "<b>📅 Tuesday · Push</b>" in text and "⚠️ Please check:" in text and "dip is a movement" in text
-    assert text.endswith("or /day fri for any day.")
+    assert "📅 <b>Tuesday</b> · Push" in text and "⚠️ <b>Please check</b>" in text and "dip is a movement" in text
+    assert text.index("Please check") < text.index("or /day fri for any day.")
 
 
 async def test_morning_message_is_the_card_with_buttons(app, claude, clock):
@@ -253,7 +255,7 @@ async def test_morning_message_is_the_card_with_buttons(app, claude, clock):
     await bot.job_daily_workout(ctx(app))
     messages = app.tg.sent()[before:]
     assert_telegram_accepts(messages)
-    assert messages[0]["text"].startswith("<b>☀️ Good morning. Today's workout</b>\n\n<b>📅 Thursday 1 Oct")
+    assert messages[0]["text"].startswith("☀️ <b>GOOD MORNING</b> · Today's workout\n\n📅 <b>THURSDAY 1 OCT")
     markup = json.loads(messages[-1]["reply_markup"]) if isinstance(messages[-1]["reply_markup"], str) else messages[-1]["reply_markup"]
     data = [b["callback_data"] for row in markup["inline_keyboard"] for b in row]
     assert data == ["alt:2026-10-01:light", "alt:2026-10-01:short"]
@@ -261,17 +263,19 @@ async def test_morning_message_is_the_card_with_buttons(app, claude, clock):
     before = len(app.tg.sent())
     await bot.job_daily_workout(ctx(app))
     rest = app.tg.sent()[before:]
-    assert rest[0]["text"].startswith("<b>☀️ Good morning. Rest day today.</b>\n\n<b>📅 Sunday 4 Oct · Rest</b>")
+    assert rest[0]["text"].startswith("☀️ <b>GOOD MORNING</b> · Rest day today\n\n📅 <b>SUNDAY 4 OCT</b> · Rest")
     assert "reply_markup" not in rest[-1] and "/done when you finish" not in rest[-1]["text"]
 
 
 async def test_card_notes_status_and_days_off(coach, claude, clock):
     await coach.build_week(MONDAY)
     coach.store.set_session(date(2026, 9, 30), "done", coach.now(), "test")
-    blocks = coach.day_view(date(2026, 9, 30), "Heading & more", ["⚠️ Your Garmin data says recovery looks low"])
-    assert blocks[0] == "<b>Heading &amp; more</b>\n✅ Already marked done today.\n⚠️ Your Garmin data says recovery looks low"
+    blocks = coach.day_view(date(2026, 9, 30), bot.header("session", "Heading & more"), ["⚠️ Your Garmin data says recovery looks low"])
+    assert blocks[0] == "🏋️ <b>TODAY'S SESSION</b> · Heading &amp; more"
+    assert blocks[1].startswith("📅 <b>WEDNESDAY 30 SEP</b>")
+    assert blocks[2] == "✅ Already marked done today.\n⚠️ Your Garmin data says recovery looks low"
     coach.store.set_session(date(2026, 10, 2), "skipped", coach.now(), "test")
-    assert coach.day_view(date(2026, 10, 2))[0] == "⏭ Marked as skipped on Friday."
+    assert coach.day_view(date(2026, 10, 2))[1] == "⏭ Marked as skipped on Friday."
     assert coach.day_view(date(2026, 10, 5)) is None  # next week has no plan yet
 
 
@@ -282,9 +286,9 @@ async def test_html_rejected_falls_back_to_plain_text_with_links(app, claude, cl
     await send(app, "/today")
     plain = [p for p in app.tg.sent()[before:] if "parse_mode" not in p]
     text = "\n".join(p["text"] for p in plain)
-    assert "<b>" not in text and "📅 Wednesday 30 Sep · Legs and core" in text
+    assert "<b>" not in text and "📅 WEDNESDAY 30 SEP · Legs and core" in text
     assert "Elbows < 45 degrees" in text
-    assert "Form video: Band external rotation proper form: https://www.youtube.com/results?search_query=" in text
+    assert "Form video: https://www.youtube.com/results?search_query=Band+external+rotation+proper+form" in text
 
 
 def test_long_days_are_split_between_messages():
@@ -302,9 +306,9 @@ def test_long_days_are_split_between_messages():
     for message in messages:
         assert check_message({"text": message, "parse_mode": "HTML"}) is None
         assert len(bot.ENTITY_RE.findall(message)) <= 90
-    starts = [m.split("\n", 1)[0] for m in messages[1:]]
-    assert all(s.startswith("<b>") for s in starts)  # a message never starts inside a card
-    assert sum(m.count("<b>🔙 BACK</b>\n\n<b>7 · Back move 0</b>") for m in messages) == 1
+    block_starts = {b.split("\n", 1)[0] for b in blocks}
+    assert all(m.split("\n", 1)[0] in block_starts for m in messages)  # a message never starts inside a card
+    assert sum(m.count("🔙 <b>BACK</b>\n\n🔙 <b>7 · Back move 0</b>") for m in messages) == 1
 
 
 def test_body_part_emojis():
@@ -334,8 +338,8 @@ async def test_skip_keeps_past_days_and_rewrites_the_rest(app, claude, clock):
     assert after["days"][3]["note"] == "Adjusted after the skip." and after["notes"][-1] == "ADJUSTED"
     assert "📅 Wednesday: Legs and core (skipped)" in coach.store.load_plan(MONDAY)
     last = app.tg.texts()[-1]
-    assert "Here is the rest of your week, adjusted:" in last and "📅 Thu: Upper body and rehab" in last
-    assert "🫸 Chest: Dumbbells move W1 D4 N1" in last and "📅 Wed" not in last
+    assert "the rest of your week, adjusted" in last and "📅 <b>Thu</b> · Upper body and rehab" in last
+    assert "🫸 Chest: Dumbbells move W1 D4 N1" in last and "📅 <b>Wed</b>" not in last
 
 
 async def test_sunday_overview_lists_body_parts(app, claude, clock):
@@ -343,8 +347,8 @@ async def test_sunday_overview_lists_body_parts(app, claude, clock):
     clock.set(2026, 10, 4, 20, 0)
     await bot.job_weekly_plan(ctx(app))
     text = app.tg.texts()[-1]
-    assert "🗓 Next week is ready. Week 2" in text
-    assert "📅 Fri: Legs and run, or swim" in text and "🏊 Swim: Easy freestyle" in text
+    assert text.startswith("🗓 <b>NEXT WEEK</b> · Week 2") and "Next week is ready." in text
+    assert "📅 <b>Fri</b> · Legs and run, or swim" in text and "🏊 Swim: Easy freestyle" in text
     assert "🩹 Shoulder rehab: Band external rotation" in text
     assert OWNER == app.bot_data["coach"].cfg.owner_id
 
@@ -392,8 +396,8 @@ async def test_lighter_version_is_a_card(app, claude, clock):
     messages = html_messages(app, before)
     assert_telegram_accepts(messages)
     text = "\n\n".join(m["text"] for m in messages)
-    assert text.startswith("<b>📅 Wednesday 30 Sep · Legs and core</b>\n<i>🪶 Lighter version of today's session</i>")
-    assert "⏱ About 45 min" in text and "<code>2 × 10</code> · <b>12.5 kg</b> · rest 1 min 30 s · RPE 5" in text
+    assert text.startswith("📅 <b>WEDNESDAY 30 SEP</b> · Legs and core\n<i>🪶 Lighter version of today's session</i>")
+    assert "⏱ About 45 min" in text and "<code>2 × 10</code> @ <b>12.5 kg</b>\n⏸ rest 1 min 30 s · RPE 5" in text
     assert "💬 Fewer sets and lighter weights." in text and "<blockquote expandable>" in text
     coach = app.bot_data["coach"]
     memory = coach.store.memory(OWNER)[-1]
@@ -421,7 +425,7 @@ async def test_alt_version_gets_the_injury_check(app, claude, clock):
     assert fix.startswith("Your session below has problems the bot found:") and "dip is a movement" in fix
     text = "\n\n".join(m["text"] for m in html_messages(app, before))
     assert "Push up" in text and "💬 FIXED" in text  # the fix swapped the dips
-    assert "⚠️ Please check:" in text and "upright row" in text  # the fake left the upright row in
+    assert "⚠️ <b>Please check</b>" in text and "upright row" in text  # the fake left the upright row in
 
 
 async def test_alt_version_falls_back_to_a_text_answer(app, claude, clock):

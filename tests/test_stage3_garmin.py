@@ -154,7 +154,7 @@ async def test_session_reminder_warns_on_poor_recovery(app, claude, clock, garmi
     clock.set(2026, 9, 30, 17, 30)
     await bot.job_session_reminder(SimpleNamespace(bot=app.bot, application=app, job=None))
     text = app.tg.texts()[-1]
-    assert text.startswith("🏋️ Today's session")
+    assert text.startswith("🏋️ <b>TODAY'S SESSION</b>")
     assert "⚠️ Your Garmin data says recovery looks low today: short sleep (5.2 h)" in text
     assert "tap Lighter version below" in text
 
