@@ -19,6 +19,9 @@ services:
       # Change the left side if garmin-monitor lives elsewhere (Docker creates an
       # empty folder if this path does not exist, and /status then says so).
       - /volume1/docker/garmin-monitor/data:/garmin:ro
+      # Obsidian vault: the movement log (Activity/) and memory (Workouts/, Exercises/).
+      # Set VAULT_DIR=/vault in bot.env; leave VAULT_DIR empty to turn it off.
+      - "/volume1/James/Obsidian/Gym Coach:/vault"
     logging:
       driver: json-file
       options:

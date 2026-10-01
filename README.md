@@ -180,6 +180,17 @@ If the bot was off at a reminder time, it catches up when it starts. It sends a 
 - **Docker.** The container runs as a normal user (`PUID`/`PGID`), with `init` to reap processes and a health check the NAS Docker app shows. To pin Claude Code to one version, build with `sudo CLAUDE_CODE_VERSION=2.1.285 docker compose up -d --build`.
 - **Log safety.** Tokens are never logged. The `httpx` logger is set to WARNING because it prints the bot token in request URLs, and every log line is filtered for secrets.
 
+## Obsidian vault (movement log + memory)
+
+With `VAULT_DIR=/vault` in `bot.env` and the vault volume in `compose.yaml` (`/volume1/James/Obsidian/Gym Coach`), the bot keeps an Obsidian vault:
+
+- `Activity/YYYY-MM-DD.md`: one line per event, `- HH:MM emoji **what** · detail · [[note]]` (Singapore time): plans saved, workouts sent, done or skipped, logs, shoulder ratings, `/coach` and `/gymstatus` answers, self repairs.
+- `Workouts/YYYY-MM-DD Weekday.md`: that day's planned session, and a `## History` of what happened (logged, done, skipped, rating).
+- `Exercises/<name>.md`: every weight and reps you `/log`, in `## History` (the progression).
+- `Home.md`: links to the latest days, workouts and every exercise.
+
+Before every Claude call (plans, `/coach`, lighter or shorter sessions) the bot passes a capped excerpt (about 4,000 characters, newest first) of the recent Activity, workouts and exercise progression, so the coach knows what you lifted last time and what you skipped. History sections are append only; everything else is safe to edit. Vault errors are only logged, the bot carries on. No tokens or full prompts are written there.
+
 ## Self repair
 
 The bot is built to keep running on the NAS without you watching it.
