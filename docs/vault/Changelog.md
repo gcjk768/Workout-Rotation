@@ -4,6 +4,7 @@ updated: 2026-10-01
 ---
 # Changelog
 ## 2026-10-01
+- feat: Thursday is legs OR a run (plan gives both, you pick one), like Friday's run or swim.
 - feat: one body part per upper body day: `UPPER_BODY_ROTATION` = Chest, Back, Shoulders, Arms. Four parts slide across Mon–Wed, so one sits out each week (week 1 C/B/S, week 2 B/S/A, week 3 S/A/C, week 4 A/C/B).
 - feat: weekly body-part rotation. Mon–Wed = chest and triceps / back and biceps / shoulders and core, shifting one day each week (`week_split` + `UPPER_BODY_ROTATION` in `bot.py`). Thu = legs then an easy run; Fri = run or swim. Replaces the "Claude picks a fixed split in week 1" logic (`state["split"]` no longer written).
 - feat: `BOT_CHAT` (group/topic, e.g. the owner Channel `<TELEGRAM_CHAT_ID>/3038`). Scheduled sends and replies go to that topic (`topic()` adds `message_thread_id` in every send); `gate` only lets ALLOWED_USER_IDS through in that topic or a DM, so other bots' topics never trigger it. No duplicate 🩺 alert when `REPAIR_ALERT_CHAT` is the same topic.

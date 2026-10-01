@@ -408,7 +408,7 @@ async def test_first_plan_sets_week_one_and_the_rotating_split(coach, claude):
     request = claude.last()["stdin"]
     assert "Week number: 1" in request and "Main equipment this week: dumbbells" in request
     assert "Monday: Chest\nTuesday: Back\nWednesday: Shoulders\n" in request
-    assert "Thursday: Legs, then an easy run\nFriday: Run or swim" in request
+    assert "Thursday: Legs or run\nFriday: Run or swim" in request
     assert "I did not send a Sunday check in answer" in request
     assert "📅 Monday: Push" in request  # format rules are included
     state = coach.store.state()
