@@ -117,8 +117,7 @@ async def test_plan_is_built_as_structured_data(coach, claude):
     assert saved == result.data and [s["body_part"] for s in saved["days"][4]["sections"]] == [
         "Swim", "Legs (if you do not swim)", "Run"]
     text = coach.store.load_plan(MONDAY)
-    assert text.startswith("Push/pull suits") and "📅 Friday: Legs and run, or swim" in text
-    assert coach.store.state()["split"]["0"] == "Push"
+    assert "📅 Friday: Legs and run, or swim" in text
 
 
 async def test_injury_problem_sends_the_data_back_for_one_fix(coach, claude):
@@ -233,7 +232,6 @@ async def test_week_is_a_short_summary_by_body_part(app, claude, clock):
     assert "🫸 <b>Chest</b>: Dumbbells move W1 D3 N1 3×10 @ 12.5 kg" in text
     assert "🏃 <b>Run</b>: Easy run 1×3 km" in text  # no @ for a pace without kg
     assert "🧘 <b>Mobility</b>: Cat cow 2×10" in text
-    assert "<blockquote expandable>🧠 Push/pull suits" in text
     assert text.endswith("Send /today for today's full workout, or /day fri for any day.")
 
 

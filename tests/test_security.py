@@ -92,3 +92,35 @@ def test_config_repr_hides_tokens(cfg):
     text = repr(cfg)
     assert cfg.telegram_token not in text
     assert "FAKEFAKE" not in text
+
+
+async def test_bot_chat_topic_is_home_and_other_topics_are_ignored(cfg, clock, claude, monkeypatch):
+    from conftest import FakeTelegram, message_update
+
+    monkeypatch.setattr(cfg, "bot_chat", (-100555, 3038))
+    app = bot.build_application(cfg, request=(tg := FakeTelegram()), updates_request=FakeTelegram(), concurrent=False)
+    await app.initialize()
+    app.tg = tg
+    try:
+        def in_topic(text, thread, user=OWNER):
+            u = message_update(app, text, user_id=user, chat_id=-100555, chat_type="supergroup").to_dict()
+            u["message"].update(message_thread_id=thread, is_topic_message=True)
+            return bot.Update.de_json(u, app.bot)
+
+        await app.process_update(in_topic("/whoami", 2930))  # another bot's topic
+        await app.process_update(in_topic("/whoami", 3038, user=STRANGER))
+        assert app.tg.sent() == []
+        await app.process_update(in_topic("/whoami", 3038))
+        [msg] = app.tg.sent()
+        assert int(msg["chat_id"]) == -100555 and int(msg["message_thread_id"]) == 3038
+        await bot.owner_send(SimpleNamespace(bot=app.bot, application=app), "reminder")  # scheduled sends go there too
+        assert int(app.tg.sent()[-1]["message_thread_id"]) == 3038
+    finally:
+        await app.shutdown()
+
+
+def test_week_split_rotates_the_upper_body_days():
+    assert [bot.week_split(1)[d] for d in range(3)] == ["Chest and triceps", "Back and biceps", "Shoulders and core"]
+    assert [bot.week_split(2)[d] for d in range(3)] == ["Back and biceps", "Shoulders and core", "Chest and triceps"]
+    assert bot.week_split(4) == bot.week_split(1)
+    assert bot.week_split(2)[3] == "Legs, then an easy run" and bot.week_split(2)[4] == "Run or swim"
