@@ -974,7 +974,7 @@ def is_deload(week: int) -> bool:
     return (week - 1) % len(EFFORT_WAVE) == len(EFFORT_WAVE) - 1
 
 
-UPPER_BODY_ROTATION = ["Chest and triceps", "Back and biceps", "Shoulders and core"]
+UPPER_BODY_ROTATION = ["Chest", "Back", "Shoulders", "Arms"]  # four parts on three days: one sits out each week
 
 
 def week_split(week: int) -> dict[int, str]:
@@ -1836,7 +1836,7 @@ Recovery and progress
 Use my workout logs to set my weights and progress me week to week. If my Garmin data shows poor recovery (short sleep, low body battery, or HRV below my usual), make today lighter. Count my logged runs toward my weekly running.
 
 How my plan works
-1. The bot gives you each week's split: one body part group per upper body day (chest and triceps, back and biceps, shoulders and core), rotating to a different day every week. Follow it.
+1. The bot gives you each week's split: one body part per upper body day (chest, back, shoulders or arms), rotating to a different day every week. Train only that body part that day, plus the shoulder rehab block. Follow it.
 2. Every exercise changes each week as the main equipment rotates.
 3. Effort follows a 4 week wave: three building weeks, then a lighter deload week.
 4. For each training day: a 5 to 10 minute warm up, then each exercise with sets x reps, rest time, one short form cue and a video line, then a short cool down.

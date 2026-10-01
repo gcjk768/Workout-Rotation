@@ -120,7 +120,8 @@ async def test_bot_chat_topic_is_home_and_other_topics_are_ignored(cfg, clock, c
 
 
 def test_week_split_rotates_the_upper_body_days():
-    assert [bot.week_split(1)[d] for d in range(3)] == ["Chest and triceps", "Back and biceps", "Shoulders and core"]
-    assert [bot.week_split(2)[d] for d in range(3)] == ["Back and biceps", "Shoulders and core", "Chest and triceps"]
-    assert bot.week_split(4) == bot.week_split(1)
+    assert [bot.week_split(1)[d] for d in range(3)] == ["Chest", "Back", "Shoulders"]
+    assert [bot.week_split(2)[d] for d in range(3)] == ["Back", "Shoulders", "Arms"]
+    assert [bot.week_split(3)[d] for d in range(3)] == ["Shoulders", "Arms", "Chest"]
+    assert bot.week_split(5) == bot.week_split(1)
     assert bot.week_split(2)[3] == "Legs, then an easy run" and bot.week_split(2)[4] == "Run or swim"
