@@ -399,7 +399,7 @@ async def test_memory_keeps_last_six_turns(coach, claude):
 # ---------------------------------------------------------------------------
 
 
-async def test_first_plan_sets_week_one_and_saves_split(coach, claude):
+async def test_first_plan_sets_week_one_and_the_rotating_split(coach, claude):
     result = await coach.build_week(date(2026, 9, 28))
     path = coach.store.plan_path(date(2026, 9, 28))
     assert path.name == "2026-09-28.md" and path.exists()
@@ -407,12 +407,12 @@ async def test_first_plan_sets_week_one_and_saves_split(coach, claude):
     assert meta["week"] == 1 and meta["equipment"] == "dumbbells" and meta["effort"].startswith("Building week 1")
     request = claude.last()["stdin"]
     assert "Week number: 1" in request and "Main equipment this week: dumbbells" in request
-    assert "first week" in request and "Compare a push/pull split" in request
+    assert "Monday: Chest and triceps\nTuesday: Back and biceps\nWednesday: Shoulders and core" in request
+    assert "Thursday: Legs, then an easy run\nFriday: Run or swim" in request
     assert "I did not send a Sunday check in answer" in request
     assert "📅 Monday: Push" in request  # format rules are included
     state = coach.store.state()
     assert state["program_start"] == "2026-09-28"
-    assert state["split"]["0"] == "Push" and state["split"]["6"] == "Rest"
     assert result.warnings == []
 
 
@@ -421,7 +421,7 @@ async def test_following_weeks_rotate_and_avoid_repeats(coach, claude):
     await coach.build_week(date(2026, 10, 5))
     request = claude.last()["stdin"]
     assert "Week number: 2" in request and "Main equipment this week: cables" in request
-    assert "Keep my split exactly as it is" in request and "Monday: Push\nTuesday: Pull" in request
+    assert "Monday: Back and biceps\nTuesday: Shoulders and core\nWednesday: Chest and triceps" in request
     assert "Dumbbells move W1 D1 N1" in request  # last week's exercises are listed
     await coach.build_week(date(2026, 10, 12))
     request = claude.last()["stdin"]
@@ -457,7 +457,6 @@ async def test_missing_days_trigger_a_fix_and_a_warning_if_still_wrong(coach, cl
     assert len(claude.plan_calls()) == 2  # only one fix attempt
     assert "missing these days" in claude.plan_calls()[1]["stdin"]
     assert result.warnings and "missing" in result.warnings[0]
-    assert "split" not in coach.store.state()  # an incomplete plan does not set the split
 
 
 async def test_clean_plan_needs_no_fix(coach, claude):
@@ -606,7 +605,7 @@ async def test_profile_and_status(app, claude):
     await send(app, "/plan")
     profile = (await send(app, "/profile"))[0]
     assert "Age 31, height 183 cm, weight 78 kg" in profile
-    assert "Split: Monday: Push, Tuesday: Pull" in profile
+    assert "Split this week: Monday: Chest and triceps, Tuesday: Back and biceps" in profile
     assert "Left shoulder micro tear" in profile
     status = (await send(app, "/status"))[0]
     assert "Version: 2.1.999 (Claude Code)" in status

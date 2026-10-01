@@ -3,7 +3,7 @@
 A private Telegram bot that coaches you like a personal trainer. It runs in Docker on your UGREEN NAS and uses Claude Code in headless mode (`claude -p`) for all its AI. Your Claude subscription pays for it, so no API billing is needed.
 
 - Answers training questions (`/ask`, or just write to it), with web search for real videos.
-- Builds a full 7-day plan every week. The split stays the same while the exercises change. The main equipment rotates (dumbbells, cables, machines, barbell and kettlebells). Effort follows a 4-week wave: three building weeks, then a deload.
+- Builds a full 7-day plan every week. Monday to Wednesday are upper body days by body part (chest and triceps, back and biceps, shoulders and core), and each body part moves to a different day every week. The exercises change every week. The main equipment rotates (dumbbells, cables, machines, barbell and kettlebells). Effort follows a 4-week wave: three building weeks, then a deload.
 - Protects your left shoulder. Every new plan is checked for movements your injury rules leave out, first by a rule check and then by a quick second opinion from a small Claude model. If anything slips in, Claude fixes the plan once before it's saved.
 - Sends that day's workout every morning, with buttons for a lighter or a 30-minute version. It reminds you again before the gym and checks at 9pm whether you trained. On Sunday it asks how the week went, then builds next week's plan from your answer.
 - Reads your sleep, resting heart rate, HRV, body battery, runs and workouts from your garmin-monitor app. It warns you when your recovery looks low, and marks the day done when your watch recorded a workout.
@@ -133,7 +133,7 @@ Week 1 · dumbbells · building week 1 of 3
 - Exercises are grouped by body part, and each one shows sets × reps, the weight, the rest and the effort (RPE).
 - The cue, left arm note, form video, target muscles, tempo and a shoulder friendly swap sit in a collapsed quote. Tap it to open.
 - Supersets are labelled A1 and A2.
-- Thursday is legs only; Friday is the run, with a swim option instead of the run.
+- Thursday is legs, finished with a short easy run; Friday is the run, with a swim option instead of the run.
 - The same cards arrive with the 07:00 message and the pre-gym reminder, followed by the Lighter and 30 minute buttons. Those buttons send back a card too: fewer sets, lighter weights and RPE 5 to 6, or the most important work fitted into 30 minutes. The same injury check runs on it, and your plan stays as it was.
 
 ## Reminders (Singapore time, set in `bot.env`)
@@ -172,7 +172,7 @@ If the bot was off at a reminder time, it catches up when it starts. It sends a 
   - `<Monday>.json` records the week number, equipment, effort and any warnings.
   - Each day in the text version starts with a line like `📅 Monday: Push`. The injury check, the safety review and the no-repeat list all read that text.
   - If Claude can't return the plan as data, the bot asks once more for the text format, and `/today` shows that text instead of a card. `STRUCTURED_PLANS=off` always uses the text format.
-  - The split chosen in week 1 is saved and sent back to Claude every week.
+  - The bot works out each week's split itself (`week_split` in `bot.py`) and sends it to Claude.
   - Exercises from the two previous weeks are listed so none repeat. Rehab exercises may repeat.
 - **Injury check.** Every line of every day is checked for movements your injury rules leave out, including warm-ups, finishers, options and text in brackets. Lines that only list what to avoid ("no overhead pressing, dips or upright rows") and swaps ("landmine press instead of overhead press") are not flagged. The built-in lists live in `bot.py`, so they improve with updates. Add your own with `INJURY_EXTRA_BLOCKED` and `INJURY_EXTRA_ALLOWED`, and set `INJURY_CHECK=off` once your physio clears you.
 - **Garmin.** garmin-monitor's `monitor.db` is opened read-only and never written to. Set `GARMIN_AUTO_DONE=off` if you don't want watch workouts to count as done.
@@ -203,7 +203,7 @@ The bot is built to keep running on the NAS without you watching it.
 
 ## NAS Doctor
 
-nas-doctor (a separate stack, `/volume1/docker/nas-doctor`) watches every container on the NAS. When `gym-coach-bot` is crash-looping, dead, unhealthy (the health check above) or exited with an error, it posts to the "NAS Doctor" topic and asks `claude -p` to fix it. The bot's own self repair handles problems inside the process. NAS Doctor handles the container itself: a bad build, a broken mount or a container that won't start. `/fix gym-coach-bot` in the NAS Doctor chat runs the same repair on demand. Set `REPAIR_ALERT_CHAT=-1002069000031/2930` in `bot.env` to copy every 🩺 self repair alert into the NAS Doctor topic too (the bot must be a member of that group).
+nas-doctor (a separate stack, `/volume1/docker/nas-doctor`) watches every container on the NAS. When `gym-coach-bot` is crash-looping, dead, unhealthy (the health check above) or exited with an error, it posts to the "NAS Doctor" topic and asks `claude -p` to fix it. The bot's own self repair handles problems inside the process. NAS Doctor handles the container itself: a bad build, a broken mount or a container that won't start. `/fix gym-coach-bot` in the NAS Doctor chat runs the same repair on demand. Set `REPAIR_ALERT_CHAT=-1002069000031/2930` in `bot.env` to copy every 🩺 self repair alert into the NAS Doctor topic too (the bot must be a member of that group). Set `BOT_CHAT=-1002069000031/3038` to run the bot in that group topic instead of your DM: reminders and plans go there, and the bot ignores every other topic. When `REPAIR_ALERT_CHAT` is the same topic, alerts are posted once.
 
 Runbook for NAS Doctor (and anyone else fixing this stack):
 

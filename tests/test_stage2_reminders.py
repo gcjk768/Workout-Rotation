@@ -283,7 +283,6 @@ async def test_skipped_session_rewrites_the_rest_of_the_week(app, claude, clock)
     assert "ADJUSTED" in plan and "📅 Wednesday: Legs and core (skipped)" in plan
     assert coach.store.load_plan_meta(date(2026, 9, 28))["kind"] == "adjusted"
     assert list((coach.store.root / "plans" / "history").glob("2026-09-28_*.md"))
-    assert coach.store.state()["split"]["2"] == "Legs and core"  # the split is not changed
     await send(app, "/ask what now?")
     assert "Sessions this week so far: Wednesday skipped." in claude.last()["system"]
 

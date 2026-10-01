@@ -245,7 +245,7 @@ def public_holiday(country: str, day: date) -> str | None:
     return _holiday_calendar(country.upper(), day.year).get(day)
 
 
-def parse_chat(value: str | None) -> tuple[int, int | None] | None:
+def parse_chat(value: str | None, name: str = "REPAIR_ALERT_CHAT") -> tuple[int, int | None] | None:
     """'-1002069000031/2930' (or ':2930') is a group topic; a bare ID is a whole chat."""
     value = _clean(value)
     if not value:
@@ -254,7 +254,7 @@ def parse_chat(value: str | None) -> tuple[int, int | None] | None:
     try:
         return int(chat), int(topic) if topic else None
     except ValueError as exc:
-        raise ConfigError("REPAIR_ALERT_CHAT must look like -1002069000031/2930") from exc
+        raise ConfigError(f"{name} must look like -1002069000031/2930") from exc
 
 
 def monday_of(day: date) -> date:
@@ -328,6 +328,7 @@ class Config:
     structured_plans: bool = True
     self_repair: bool = True
     repair_alert_chat: tuple[int, int | None] | None = None  # (chat, topic) that also gets 🩺 alerts
+    bot_chat: tuple[int, int | None] | None = None  # (group, topic) the bot lives in, instead of the owner's DM
     claude_retry_delay: float = 5.0
     ask_timeout: int = 240
     plan_timeout: int = 600
@@ -414,6 +415,7 @@ class Config:
             structured_plans=parse_switch(env.get("STRUCTURED_PLANS"), True),
             self_repair=parse_switch(env.get("SELF_REPAIR"), True),
             repair_alert_chat=parse_chat(env.get("REPAIR_ALERT_CHAT")),
+            bot_chat=parse_chat(env.get("BOT_CHAT"), "BOT_CHAT"),
             claude_retry_delay=float(get("CLAUDE_RETRY_DELAY", "5")),
             secrets=[
                 v
@@ -972,6 +974,16 @@ def is_deload(week: int) -> bool:
     return (week - 1) % len(EFFORT_WAVE) == len(EFFORT_WAVE) - 1
 
 
+UPPER_BODY_ROTATION = ["Chest and triceps", "Back and biceps", "Shoulders and core"]
+
+
+def week_split(week: int) -> dict[int, str]:
+    """Monday to Wednesday: each body part moves one day earlier every week. Thursday and Friday stay."""
+    n = len(UPPER_BODY_ROTATION)
+    split = {d: UPPER_BODY_ROTATION[(d + week - 1) % n] for d in range(3)}
+    return split | {3: "Legs, then an easy run", 4: "Run or swim"}
+
+
 def fmt_day(d: date) -> str:
     return f"{d:%a} {d.day} {d:%b}"
 
@@ -1236,6 +1248,14 @@ def find_video_link(text: str) -> str | None:
     return m.group(0) if m else None
 
 
+BOT_CHAT: tuple[int, int | None] | None = None  # set from Config by build_application
+
+
+def topic(chat_id: int) -> int | None:
+    """The BOT_CHAT topic when sending to that group, so every message lands in the bot's own topic."""
+    return BOT_CHAT[1] if BOT_CHAT and BOT_CHAT[0] == chat_id else None
+
+
 async def send_text(bot, chat_id: int, text: str, reply_markup=None) -> list:
     """Send as HTML in chunks under 4096 characters; plain text if Telegram objects."""
     chunks = split_text(text)
@@ -1251,11 +1271,13 @@ async def send_text(bot, chat_id: int, text: str, reply_markup=None) -> list:
                 parse_mode=ParseMode.HTML,
                 link_preview_options=preview,
                 reply_markup=markup,
+                message_thread_id=topic(chat_id),
             )
         except BadRequest as exc:
             log.warning("Telegram rejected the HTML (%s), sending plain text", exc)
             msg = await bot.send_message(
-                chat_id, to_plain(chunk), link_preview_options=preview, reply_markup=markup
+                chat_id, to_plain(chunk), link_preview_options=preview, reply_markup=markup,
+                message_thread_id=topic(chat_id),
             )
         sent.append(msg)
     return sent
@@ -1268,7 +1290,7 @@ async def typing(bot, chat_id: int):
     async def loop() -> None:
         while True:
             with contextlib.suppress(Exception):
-                await bot.send_chat_action(chat_id, ChatAction.TYPING)
+                await bot.send_chat_action(chat_id, ChatAction.TYPING, message_thread_id=topic(chat_id))
             await asyncio.sleep(4.5)
 
     task = asyncio.create_task(loop())
@@ -1789,8 +1811,8 @@ Equipment in the office gym: {equipment}
 
 Schedule
 I am in the office Monday to Friday and train at the office gym after work: from {gym_mon_thu} Monday to Thursday and from {gym_fri} on Friday.
-Thursday is leg day and Friday is running day. Keep them separate: no running on leg day and no leg training on running day.
-Friday I may go swimming instead of the run.
+Monday to Wednesday are upper body days split by body part, and the body part on each day rotates every week.
+Thursday is leg day, finished with a short easy run. Friday is running day, and I may swim instead of the run. No leg training on Friday.
 {basketball}
 If I say I missed a session, adjust the rest of the week instead of doubling up. If I say I only have 20 or 30 minutes, give a shorter version of today's session.
 If I am on leave, travelling, or it is a public holiday, give a hotel gym or bodyweight version, or move the session.
@@ -1814,11 +1836,11 @@ Recovery and progress
 Use my workout logs to set my weights and progress me week to week. If my Garmin data shows poor recovery (short sleep, low body battery, or HRV below my usual), make today lighter. Count my logged runs toward my weekly running.
 
 How my plan works
-1. Split the upper body days using either a push/pull structure or an individual body part structure. In the first week, compare both briefly, then pick the one that fits my schedule, basketball and shoulder best, and explain why in two or three sentences.
-2. The split stays the same every week, with the same muscle groups on the same days, but every exercise changes each week as the main equipment rotates.
+1. The bot gives you each week's split: one body part group per upper body day (chest and triceps, back and biceps, shoulders and core), rotating to a different day every week. Follow it.
+2. Every exercise changes each week as the main equipment rotates.
 3. Effort follows a 4 week wave: three building weeks, then a lighter deload week.
 4. For each training day: a 5 to 10 minute warm up, then each exercise with sets x reps, rest time, one short form cue and a video line, then a short cool down.
-5. For Friday's running day, give a run with distance or time and a target pace or effort. My running goals are 2.4 km under 12 minutes (5:00 per km) and 5 km under 35 minutes (7:00 per km); pick one each week and build toward it with a pace that fits my logged runs.
+5. On Thursday, finish the legs with an easy 10 to 20 minute run. For Friday's running day, give a run with distance or time and a target pace or effort. My running goals are 2.4 km under 12 minutes (5:00 per km) and 5 km under 35 minutes (7:00 per km); pick one each week and build toward it with a pace that fits my logged runs.
 6. For Friday, also give a swim session (duration and structure) that is safe for my shoulder, in case I swim instead of running.
 7. In the first week, add a short recovery note: sleep, rest days, and protein per day for my weight.
 
@@ -1882,7 +1904,7 @@ PLAN_FORMAT_RULES = """Format rules. The bot reads your plan automatically, so f
 2. Start each day with one line in exactly this form: 📅 Monday: Push. Use the day name, a colon and the day's focus. Mark rest days in the focus, for example 📅 Saturday: Basketball or rest, or 📅 Sunday: Rest or light mobility.
 3. On training days write the warm up as one line starting with "Warm up:". Then number the main exercises and the rehab exercises, one per line, like "1. Exercise name: 3 x 10, rest 90s". Under each exercise add one "Cue:" line and one "Video: [yt: exercise name proper form]" line. Finish the day with one line starting with "Cool down:".
 4. After Sunday, write the general notes once, starting with a line that begins with 📝. Do not use 📝 anywhere else.
-5. Write nothing before the first 📅 line{preface_rule}."""
+5. Write nothing before the first 📅 line."""
 
 
 # ---------------------------------------------------------------------------
@@ -1949,12 +1971,12 @@ STRUCTURED_RULES = """How to fill in the plan. The bot lays it out for Telegram,
 1. Seven days, Monday to Sunday, in order. A rest day has rest_day true and a focus like "Rest or light mobility" or "Basketball or rest"; it may hold a short Mobility section.
 2. Group each training day into sections by body part, in training order: the main compound work first, then secondary and accessory work, then core, conditioning or the run. Name sections by body part, like Back, Chest, Shoulders, Arms, Legs, Glutes, Core, Court skills, Conditioning, Run, Swim or Mobility. On upper body days add a "Shoulder rehab" section.
 3. For every exercise give sets, reps (10, 8-10 or 30 s), load (a real starting weight in kg based on my logs, or bodyweight or light band), rest in seconds, effort as RPE that matches this week's effort, tempo, the muscles it trains, one short form cue, how my left arm does it (left_arm, only when the exercise uses the arms), YouTube search words for a form video (like "single arm cable row proper form") and a shoulder friendly swap. Pair two exercises as a superset with A1 and A2 in superset when that saves time.
-4. Thursday is legs only, with no run. Friday is the running day, with no leg training: a "Run" section with distance or time and pace, and a "Swim (instead of the run)" section.
+4. Thursday is legs, finished with a "Run" section holding a short easy run. Friday is the running day, with no leg training: a "Run" section with distance or time and pace, and a "Swim (instead of the run)" section.
 5. Keep each day within my session time and put the total in minutes.
 6. warm_up and cool_down are short lists of steps. note is one or two short sentences for the day, or empty.
 7. notes are the week's general notes, one short sentence each.
 8. The video field holds only the search words, without [yt: ]. Write no dashes; use commas instead.
-9. {split_rule}"""
+9. Leave split_explanation empty."""
 
 DAY_SCHEMA = PLAN_SCHEMA["properties"]["days"]["items"]
 DAY_RULES = """How to fill in the session. The bot lays it out for Telegram, so write plain words in every field (no markdown, no emojis):
@@ -2236,13 +2258,15 @@ async def send_blocks(bot, chat_id: int, blocks: list[str], reply_markup=None) -
         preview = LinkPreviewOptions(url=video) if video else LinkPreviewOptions(is_disabled=True)
         try:
             msg = await bot.send_message(chat_id, message, parse_mode=ParseMode.HTML,
-                                         link_preview_options=preview, reply_markup=markup)
+                                         link_preview_options=preview, reply_markup=markup,
+                                         message_thread_id=topic(chat_id))
         except BadRequest as exc:
             log.warning("Telegram rejected the HTML (%s), sending plain text", exc)
             chunks = split_text(html_to_plain(message))
             for k, chunk in enumerate(chunks):
                 msg = await bot.send_message(chat_id, chunk, link_preview_options=preview,
-                                             reply_markup=markup if k == len(chunks) - 1 else None)
+                                             reply_markup=markup if k == len(chunks) - 1 else None,
+                                             message_thread_id=topic(chat_id))
         sent.append(msg)
     return sent
 
@@ -2510,11 +2534,9 @@ class Coach:
 
     # -- plans ----------------------------------------------------------------
 
-    def split_text(self) -> str | None:
-        split = self.store.state().get("split")
-        if not split:
-            return None
-        return "\n".join(f"{DAY_NAMES[int(k)]}: {v}" for k, v in sorted(split.items(), key=lambda kv: int(kv[0])))
+    def split_text(self, monday: date) -> str:
+        split = week_split(self.week_number(monday))
+        return "\n".join(f"{DAY_NAMES[d]}: {focus}" for d, focus in split.items())
 
     def previous_exercises(self, monday: date) -> list[str]:
         seen: dict[str, str] = {}
@@ -2555,7 +2577,6 @@ class Coach:
     def plan_request(self, monday: date, notes: str, structured: bool = False) -> str:
         week = self.week_number(monday)
         sunday = monday + timedelta(days=6)
-        split = self.split_text()
         lines = [
             f"Build my full training plan for the week of {fmt_long(monday)} to {fmt_long(sunday)}.",
             "",
@@ -2564,20 +2585,12 @@ class Coach:
             "it, and use other equipment only where it suits my shoulder better.",
             f"Effort this week: {effort_for(week)}",
         ]
-        if split:
-            lines += [
-                "",
-                "Keep my split exactly as it is, with the same focus on the same days, unless my "
-                "notes below ask to change it:",
-                split,
-            ]
-        else:
-            lines += [
-                "",
-                "This is my first week, so no split is set yet. Compare a push/pull split with a "
-                "body part split briefly, pick the one that fits my schedule, basketball and "
-                "shoulder best, and explain why in two or three sentences before the first day.",
-            ]
+        lines += [
+            "",
+            "This week's split. Keep exactly this focus on these days, unless my notes below ask "
+            "to change it. Saturday and Sunday are rest, basketball or light mobility:",
+            self.split_text(monday),
+        ]
         previous = self.previous_exercises(monday)
         if previous:
             lines += [
@@ -2605,23 +2618,18 @@ class Coach:
             ]
         if notes.strip():
             lines += ["", f"My notes for this plan: {notes.strip()}"]
-        lines += ["", self.format_rules(bool(split), structured)]
+        lines += ["", self.format_rules(structured)]
         return "\n".join(lines)
 
     @staticmethod
-    def format_rules(had_split: bool, structured: bool) -> str:
-        if structured:
-            return STRUCTURED_RULES.format(
-                split_rule="Leave split_explanation empty." if had_split else
-                "Put the short split comparison, and why you picked this split, in split_explanation."
-            )
-        return PLAN_FORMAT_RULES.format(preface_rule="" if had_split else ", except the short split comparison")
+    def format_rules(structured: bool) -> str:
+        return STRUCTURED_RULES if structured else PLAN_FORMAT_RULES
 
     @staticmethod
     def plan_json(data: dict) -> str:
         return json.dumps(data, ensure_ascii=False)
 
-    def fix_request(self, text: str, problems: list[str], had_split: bool, data: dict | None = None) -> str:
+    def fix_request(self, text: str, problems: list[str], data: dict | None = None) -> str:
         return "\n".join(
             [
                 "Your plan below has problems the bot found:",
@@ -2630,7 +2638,7 @@ class Coach:
                 "Rewrite the full plan. Give a shoulder friendly swap for every movement listed, "
                 "add any missing days, and keep everything else the same.",
                 "",
-                self.format_rules(had_split, structured=data is not None),
+                self.format_rules(structured=data is not None),
                 "",
                 "The plan:",
                 self.plan_json(data) if data else text,
@@ -2686,13 +2694,12 @@ class Coach:
         return self.read_plan_reply(await self.runner.run(system, make_request(False), "plan"))
 
     async def generate_plan(
-        self, monday: date, make_request, *, kind: str, save_split: bool, notes: str = "", tidy=None
+        self, monday: date, make_request, *, kind: str, notes: str = "", tidy=None
     ) -> PlanResult:
         """Run Claude, check the plan (rules, then a safety review), fix it once if needed, save it.
 
         make_request(structured) -> the request, for the structured or the text format.
         tidy(data) -> data adjusts a structured plan before the checks, like keeping past days."""
-        had_split = bool(self.store.state().get("split"))
         system = self.system_prompt(planning=monday)
         text, data = await self.first_draft(system, make_request, tidy)
         problems = self.plan_problems(text)
@@ -2710,7 +2717,7 @@ class Coach:
             try:
                 candidate, candidate_data = self.read_plan_reply(
                     await self.runner.run(
-                        system, self.fix_request(text, problems, had_split, data), "plan", PLAN_SCHEMA if data else None
+                        system, self.fix_request(text, problems, data), "plan", PLAN_SCHEMA if data else None
                     ),
                     tidy,
                 )
@@ -2741,13 +2748,9 @@ class Coach:
             "structured": data is not None,
         }
         self.store.save_plan(monday, text, meta, now.strftime("%Y%m%d-%H%M%S"), data)
-        state_update: dict[str, Any] = {
-            "last_plan_built": {"at": meta["built_at"], "monday": monday.isoformat(), "kind": kind}
-        }
-        parsed = parse_plan(text)
-        if save_split and len(parsed.days) == 7:
-            state_update["split"] = {str(i): d.focus for i, d in sorted(parsed.days.items())}
-        self.store.update_state(**state_update)
+        self.store.update_state(
+            last_plan_built={"at": meta["built_at"], "monday": monday.isoformat(), "kind": kind}
+        )
         return PlanResult(monday, text, meta, warnings, data=data)
 
     async def build_week(
@@ -2766,12 +2769,9 @@ class Coach:
                                       data=self.store.load_plan_data(monday))
             if not self.program_start():
                 self.store.update_state(program_start=monday.isoformat())
-            week = self.week_number(monday)
-            state = self.store.state()
-            save_split = not state.get("split") or week == 1 or "split" in notes.lower()
             return await self.generate_plan(
                 monday, lambda structured: self.plan_request(monday, notes, structured),
-                kind=kind, save_split=save_split, notes=notes,
+                kind=kind, notes=notes,
             )
 
     async def adjust_after_skip(self, day: date) -> PlanResult | None:
@@ -2803,7 +2803,7 @@ class Coach:
                         f"Keep {kept} exactly as written, but add (skipped) at the end of the {where}.",
                         "Keep this week's main equipment and effort. Return the full week.",
                         "",
-                        self.format_rules(True, structured),
+                        self.format_rules(structured),
                         "",
                         "This week's plan:",
                         self.plan_json(data) if structured and data else plan,
@@ -2823,7 +2823,7 @@ class Coach:
                         "split_explanation": data.get("split_explanation", "")}
 
             return await self.generate_plan(
-                monday, request, kind="adjusted", save_split=False, tidy=keep_past if data else None
+                monday, request, kind="adjusted", tidy=keep_past if data else None
             )
 
     async def alt_session(self, day: date, kind: str) -> tuple[dict, str, list[str]] | None:
@@ -3156,7 +3156,8 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str | 
 
 
 async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Only ALLOWED_USER_IDS in private chats get through. Everyone else learns their own ID.
+    """Only ALLOWED_USER_IDS in private chats, or in the BOT_CHAT topic, get through.
+    Strangers in private chats learn their own ID; groups and other topics are ignored.
 
     Every path that does not return raises ApplicationHandlerStop, even when the reply
     to a stranger fails, so no other handler ever runs for them.
@@ -3166,7 +3167,11 @@ async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     private = chat is not None and chat.type == ChatType.PRIVATE
     fresh = update.message is not None or update.callback_query is not None  # not edits
-    if user is not None and user.id in coach.cfg.allowed_ids and private and fresh:
+    home = coach.cfg.bot_chat
+    message = update.effective_message
+    in_topic = (home is not None and chat is not None and chat.id == home[0]
+                and (home[1] is None or (message is not None and message.message_thread_id == home[1])))
+    if user is not None and user.id in coach.cfg.allowed_ids and (private or in_topic) and fresh:
         return
     try:
         if user is not None and private and user.id not in coach.cfg.allowed_ids:
@@ -3218,7 +3223,7 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """A plain message in a private chat works like /ask, unless it answers the check in."""
+    """A plain message works like /ask, unless it answers the check in."""
     text = (update.effective_message.text or "").strip()
     if not text:
         return
@@ -3360,6 +3365,7 @@ async def cmd_shoulder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             update.effective_chat.id,
             document=InputFile(shoulder_csv(coach), filename=f"shoulder-ratings-{coach.today().isoformat()}.csv"),
             caption="All your ratings as a spreadsheet file, for your physio.",
+            message_thread_id=topic(update.effective_chat.id),
         )
 
 
@@ -3548,7 +3554,6 @@ def profile_text(coach: Coach) -> str:
     monday = monday_of(today)
     week = coach.week_number(monday)
     injury, updated = coach.injury_text()
-    split = coach.split_text()
     lines = [
         "**About you**",
         f"• Age {cfg.age}, height {_with_unit(cfg.height_cm, 'cm')}, weight {_with_unit(cfg.weight_kg, 'kg')}",
@@ -3563,7 +3568,7 @@ def profile_text(coach: Coach) -> str:
         f"• This week: {coach.week_label(monday)}",
         f"• Equipment rotation: {', '.join(cfg.equipment_rotation)}",
         f"• Programme started: {coach.program_start() or 'not yet, send /plan'}",
-        "• Split: " + (split.replace("\n", ", ") if split else "chosen with your first plan"),
+        "• Split this week: " + coach.split_text(monday).replace("\n", ", "),
         "",
         "**Injury notes**" + (f" (updated {updated[:10]})" if updated else ""),
         injury.strip() or "none",
@@ -3697,6 +3702,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
             await context.bot.send_message(
                 update.effective_chat.id,
                 "Sorry, something went wrong on my side. I am looking into it and will tell you what I find.",
+                message_thread_id=topic(update.effective_chat.id),
             )
     repair = getattr(context, "application", None) and context.application.bot_data.get("repair")
     if repair and error is not None:
@@ -3935,7 +3941,7 @@ class SelfRepair:
         """Tell the owner, and copy it to REPAIR_ALERT_CHAT (the NAS Doctor topic) when set."""
         await owner_send(self.ctx, view)
         target = self.coach.cfg.repair_alert_chat
-        if target is None:
+        if target is None or target == self.coach.cfg.bot_chat:  # owner_send already put it there
             return
         body = "\n\n".join(view) if isinstance(view, list) else to_html(view)
         try:
@@ -4148,7 +4154,7 @@ def add_handlers(application: Application, concurrent: bool = True) -> None:
     application.add_handler(CommandHandler("reset", cmd_reset))
     application.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
     application.add_handler(
-        MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_text, **slow)
+        MessageHandler(filters.TEXT & ~filters.COMMAND, on_text, **slow)  # gate keeps out groups
     )
     application.add_error_handler(on_error, block=not concurrent)  # a diagnosis takes a minute
 
@@ -4190,7 +4196,10 @@ def ptb_days(days: list[int]) -> tuple[int, ...]:
 
 
 async def owner_send(context: ContextTypes.DEFAULT_TYPE, text: str | list[str], reply_markup=None) -> list:
+    """Reminders and alerts go to the BOT_CHAT topic when set, else to the owner's DM."""
     coach = coach_of(context)
+    if coach.cfg.bot_chat:
+        return await send_view(context.bot, coach.cfg.bot_chat[0], text, reply_markup=reply_markup)
     if coach.cfg.owner_id is None:
         log.warning("No ALLOWED_USER_IDS, so reminders have nowhere to go")
         return []
@@ -4504,6 +4513,8 @@ def build_application(
     if request is not None:
         builder = builder.request(request).get_updates_request(updates_request or request)
     application = builder.build()
+    global BOT_CHAT
+    BOT_CHAT = cfg.bot_chat
     application.bot_data["coach"] = coach = coach or Coach(cfg)
     application.bot_data["repair"] = SelfRepair(application, coach)
     add_handlers(application, concurrent)
