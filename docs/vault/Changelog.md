@@ -1,8 +1,12 @@
 ---
 tags: [active]
-updated: 2026-10-01
+updated: 2026-10-02
 ---
 # Changelog
+## 2026-10-02
+- feat: Obsidian vault (NAS standard "movement log + memory") at `/volume1/<USER>/Obsidian/Gym Coach`, mounted at `/vault`, `VAULT_DIR` in `bot.env` (empty = off). `Vault` class in `bot.py`: `Activity/YYYY-MM-DD.md` gets `- HH:MM emoji **what** · detail · [[note]]` for plans saved, workouts sent/done/skipped, logs, shoulder ratings, `/coach` + `/gymstatus` answers and self repairs; `Workouts/<date> <Weekday>.md` (plan + `## History` of results) and `Exercises/<name>.md` (weight progression in `## History`); `Home.md` MOC. Hooks sit in `Store` (`add_log`, `set_session`, `add_rating`, `save_plan`), so every caller logs.
+- feat: memory. `Coach.system_prompt` appends `Vault.memory()`, a ~4,000 char excerpt, newest first (Activity up to 3/5 of it, then latest workouts and exercise progression), so plans, `/coach` and lighter/short sessions know the last lifts and skips.
+- Best effort: every vault method is wrapped by `best_effort` (logs a warning, returns ""); secrets are redacted; files chmod 664 / folders 775, chown to PUID/PGID when root; `entrypoint.sh` creates and chowns only the vault folder. Tests: `tests/test_vault.py`.
 ## 2026-10-01
 - feat: every Telegram message uses the HTML card style: header `emoji <b>TITLE</b> · subtitle` (fixed emoji per message type in `SECTION_TITLES`, built by `header()`/`card()` in `bot.py`), one block per item, `━━━━━━━━━━━━━━━━` between body-part sections, hints in `<i>`, background (split reasoning, plan notes, last week in numbers) folded in `<blockquote expandable>` at the end. Workout cards: one block per exercise `🫸 <b>1 · Bench</b> · <code>3 × 10</code> @ <b>12.5 kg</b>`, then a ⏸ rest/effort line and a ▶️ Form video link.
 - refactor: one send path. `send_view` → `send_blocks` for everything (old `send_text` removed); text and Claude answers go through `text_blocks` (escaped by `to_html`). `pack_blocks` cuts only between blocks, or inside an oversized block at a line outside every tag (`split_block`). Telegram 400 → resent as plain text (`html_to_plain`). The repair mirror to `REPAIR_ALERT_CHAT` uses it too (was a raw `[:4096]` cut that could split a tag). Tests: `tests/test_card_style.py`.

@@ -330,6 +330,7 @@ class Config:
     repair_alert_chat: tuple[int, int | None] | None = None  # (chat, topic) that also gets 🩺 alerts
     bot_chat: tuple[int, int | None] | None = None  # (group, topic) the bot lives in, instead of the owner's DM
     claude_retry_delay: float = 5.0
+    vault_dir: str = ""  # Obsidian vault (movement log + memory); empty = off
     ask_timeout: int = 240
     plan_timeout: int = 600
     secrets: list[str] = dataclasses.field(default_factory=list, repr=False)
@@ -417,6 +418,7 @@ class Config:
             repair_alert_chat=parse_chat(env.get("REPAIR_ALERT_CHAT")),
             bot_chat=parse_chat(env.get("BOT_CHAT"), "BOT_CHAT"),
             claude_retry_delay=float(get("CLAUDE_RETRY_DELAY", "5")),
+            vault_dir=get("VAULT_DIR"),
             secrets=[
                 v
                 for v in (
@@ -496,6 +498,7 @@ class Store:
     def __init__(self, data_dir: Path):
         self.root = Path(data_dir)
         self.repairs: list[dict] = []  # damaged files repaired since the last self check
+        self.vault = Vault(None, ZoneInfo("UTC"))  # Coach swaps in the real one (VAULT_DIR)
         for sub in ("plans", "plans/history", "checkins"):
             (self.root / sub).mkdir(parents=True, exist_ok=True)
 
@@ -624,6 +627,7 @@ class Store:
         elif data_path.exists():
             data_path.unlink()  # a text plan replaced it
         self.write_json(f"plans/{monday.isoformat()}.json", meta)
+        self.vault.plan_saved(monday, text, meta)
 
     def plan_mondays(self) -> list[date]:
         out = []
@@ -650,6 +654,7 @@ class Store:
             "logs.jsonl",
             {"date": when.date().isoformat(), "time": when.strftime("%H:%M"), "text": text},
         )
+        self.vault.logged(when, text)
 
     def logs(self, since: date | None = None) -> list[dict]:
         rows = self._read_jsonl("logs.jsonl")
@@ -660,6 +665,7 @@ class Store:
             "shoulder.jsonl",
             {"date": day.isoformat(), "time": when.strftime("%H:%M"), "rating": rating, "note": note},
         )
+        self.vault.rating(day, rating, note)
 
     def ratings(self, since: date | None = None) -> list[dict]:
         rows = [r for r in self._read_jsonl("shoulder.jsonl") if isinstance(r.get("rating"), int)]
@@ -677,6 +683,7 @@ class Store:
             "source": source,
         }
         self.write_json("sessions.json", data)
+        self.vault.session(day, status, source)
 
     def checkin_path(self, sunday: date) -> Path:
         return self.root / "checkins" / f"{sunday.isoformat()}.txt"
@@ -714,6 +721,189 @@ class Store:
         data = self.read_json("memory.json", {})
         data.pop(str(chat_id), None)
         self.write_json("memory.json", data)
+
+
+def best_effort(fn):
+    """Vault I/O never breaks the bot: any error is logged and the call returns a blank."""
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        if not self.root:
+            return ""
+        try:
+            return fn(self, *args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - the vault is a nice to have
+            log.warning("Vault %s failed: %s", fn.__name__, exc)
+            return ""
+    return wrapper
+
+
+NOTE_NAME_RE = re.compile(r'[\\/:*?"<>|#^\[\]]+')
+
+
+def workout_title(day: date) -> str:
+    return f"{day.isoformat()} {DAY_NAMES[day.weekday()]}"
+
+
+def _take(lines: list[str], budget: int) -> list[str]:
+    """The first lines that fit in budget characters (the line that would overflow is cut)."""
+    out, used = [], 0
+    for line in lines:
+        if used + len(line) + 1 > budget:
+            if budget - used > 40:
+                out.append(line[: budget - used - 2] + "…")
+            break
+        out.append(line)
+        used += len(line) + 1
+    return out
+
+
+class Vault:
+    """The Obsidian vault at VAULT_DIR (NAS vault standard): Activity/YYYY-MM-DD.md is the
+    movement log, Workouts/ and Exercises/ are entity notes with an append-only ## History,
+    Home.md is the map. memory() reads it back into every Claude prompt. Best effort only:
+    every public method logs and returns "" on any error, and does nothing without VAULT_DIR."""
+
+    def __init__(self, root: str | Path | None, tz: ZoneInfo, secrets: list[str] | None = None):
+        self.root = Path(root) if root else None
+        self.tz = tz
+        self.secrets = secrets or []
+
+    # -- files ------------------------------------------------------------------
+
+    def _own(self, path: Path) -> None:
+        """Keep files editable by the owner: 664 (775 for folders), and his uid when we run as root."""
+        os.chmod(path, 0o775 if path.is_dir() else 0o664)
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            os.chown(path, int(os.environ.get("PUID") or 1000), int(os.environ.get("PGID") or 1000))
+
+    def _dir(self, name: str) -> Path:
+        path = self.root / name
+        if not path.is_dir():
+            path.mkdir(parents=True, exist_ok=True)
+            self._own(path)
+        return path
+
+    def _write(self, path: Path, text: str) -> None:
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        self._own(tmp)
+        os.replace(tmp, path)
+
+    def _clean(self, text: Any, cap: int = 200) -> str:
+        text = redact(" ".join(str(text).replace("*", "").split()), self.secrets)  # keep **what** the only bold
+        return text if len(text) <= cap else text[: cap - 1] + "…"
+
+    # -- write --------------------------------------------------------------------
+
+    @best_effort
+    def event(self, emoji: str, what: str, detail: str = "", link: str = "") -> str:
+        """One line in today's Activity note: - HH:MM emoji **what** · detail · [[link]] (local time)."""
+        now = now_in(self.tz)
+        path = self._dir("Activity") / f"{now.date().isoformat()}.md"
+        line = " · ".join(p for p in (f"- {now:%H:%M} {emoji} **{what}**", self._clean(detail),
+                                      f"[[{link}]]" if link else "") if p)
+        new = not path.exists()
+        with path.open("a", encoding="utf-8") as fh:
+            if new:
+                fh.write(f"---\ntags: [active]\nupdated: {now.date().isoformat()}\n---\n"
+                         f"# Activity {fmt_long(now.date())}\n")
+            fh.write(line + "\n")
+        if new:
+            self._own(path)
+            self.home()
+        return line
+
+    @best_effort
+    def note(self, folder: str, title: str, history: str, body: str | None = None) -> str:
+        """Add a dated line to an entity note's ## History (append only). body replaces the part
+        above History; None keeps it. Written atomically (tmp + rename)."""
+        now = now_in(self.tz)
+        path = self._dir(folder) / f"{NOTE_NAME_RE.sub(' ', title).strip()}.md"
+        old = path.read_text(encoding="utf-8") if path.exists() else ""
+        head, _, past = old.partition("\n## History\n")
+        if head.startswith("---\n"):
+            head = head.split("\n---\n", 1)[-1]
+        if body is None:
+            body = head.strip() or f"# {title}"
+        past = past.strip("\n")
+        line = f"- {now:%Y-%m-%d %H:%M} {self._clean(history, 300)}"
+        self._write(path, f"---\ntags: [active]\nupdated: {now.date().isoformat()}\n---\n{body.strip()}\n\n"
+                          "## History\n" + (past + "\n" if past else "") + line + "\n")
+        if not old:
+            self.home()
+        return line
+
+    @best_effort
+    def home(self) -> str:
+        """Home.md, the map of contents: the latest Activity days and workouts, every exercise."""
+        def links(folder: str, newest: bool, limit: int | None = None) -> str:
+            names = sorted((p.stem for p in (self.root / folder).glob("*.md")), reverse=newest)[:limit]
+            return "\n".join(f"- [[{n}]]" for n in names) or "- none yet"
+        text = (f"---\ntags: [active]\nupdated: {now_in(self.tz).date().isoformat()}\n---\n# Gym Coach\n"
+                "Movement log and memory of the gym coach bot (`gym-coach-bot` on the NAS). The bot writes "
+                "here and reads Activity, Workouts and Exercises back before every Claude call, so the coach "
+                "knows what you lifted and what you skipped. Safe to edit; History sections are append only.\n\n"
+                f"## Activity (latest days)\n{links('Activity', True, 14)}\n\n"
+                f"## Workouts (latest)\n{links('Workouts', True, 14)}\n\n"
+                f"## Exercises\n{links('Exercises', False)}\n")
+        self._write(self.root / "Home.md", text)
+        return text
+
+    def plan_saved(self, monday: date, text: str, meta: dict) -> None:
+        week, kind, equipment = meta.get("week", "?"), meta.get("kind", "build"), meta.get("equipment", "")
+        first = ""
+        for i, day in sorted(parse_plan(text).days.items()):
+            if day.is_rest:
+                continue
+            when = monday + timedelta(days=i)
+            first = first or workout_title(when)
+            self.note("Workouts", workout_title(when), f"📋 plan saved ({kind}) · {day.focus}",
+                      body=f"# {fmt_long(when)} · {day.focus}\nWeek {week} · {equipment}.\n\n## Plan\n{day.text.strip()}")
+        self.event("📋", f"plan saved ({kind})", f"week {week} · {equipment}", first)
+
+    def logged(self, when: datetime, text: str) -> None:
+        workout = workout_title(when.date())
+        self.event("🏋️", "workout logged", text, workout)
+        self.note("Workouts", workout, f"🏋️ logged · {text}")
+        for item in parse_log_items(text):
+            name = item["key"][:1].upper() + item["key"][1:]
+            self.note("Exercises", name, f"{_fmt_item(item) or item['name']} · [[{workout}]]",
+                      body=f"# {name}\nWeights and reps from /log. History is the progression, oldest first.")
+
+    def session(self, day: date, status: str, source: str) -> None:
+        emoji = "✅" if status == "done" else "⏭️"
+        self.event(emoji, f"workout {status}", f"{fmt_day(day)} · via {source}", workout_title(day))
+        self.note("Workouts", workout_title(day), f"{emoji} {status} (via {source})")
+
+    def rating(self, day: date, rating: int, note: str) -> None:
+        detail = f"{rating}/10" + (f" · {note}" if note else "")
+        self.event("🩹", "shoulder rated", detail, workout_title(day))
+        self.note("Workouts", workout_title(day), f"🩹 left shoulder {detail}")
+
+    # -- read (memory) ------------------------------------------------------------
+
+    @best_effort
+    def memory(self, limit: int = 4000) -> str:
+        """A capped excerpt, newest first: recent Activity lines (up to 3/5 of the cap), then the
+        latest workouts with their results and the recently trained exercises' progression."""
+        lines = ["Recent activity (newest first):"]
+        for path in sorted((self.root / "Activity").glob("*.md"), reverse=True)[:7]:
+            events = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.startswith("- ")]
+            lines += [f"- {path.stem} {ln[2:]}" for ln in reversed(events)]
+        lines = _take(lines, limit * 3 // 5)
+        today = now_in(self.tz).date().isoformat()
+        workouts = sorted((p for p in (self.root / "Workouts").glob("*.md") if p.stem[:10] <= today),
+                          key=lambda p: p.stem, reverse=True)[:4]
+        exercises = sorted((self.root / "Exercises").glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]
+        for heading, notes in (("Latest workouts and results (newest first):", workouts),
+                               ("Exercise progression (newest first):", exercises)):
+            if notes:
+                lines.append(heading)
+            for path in notes:
+                past = path.read_text(encoding="utf-8").partition("\n## History\n")[2].splitlines()
+                past = [ln[2:] for ln in past if ln.startswith("- ")][-4:]
+                lines.append(f"- {path.stem}: " + " | ".join(reversed(past)))
+        return "\n".join(_take(lines, limit)) if len(lines) > 1 else ""
 
 
 # ---------------------------------------------------------------------------
@@ -2370,6 +2560,7 @@ class Coach:
     def __init__(self, cfg: Config, store: Store | None = None, runner: ClaudeRunner | None = None):
         self.cfg = cfg
         self.store = store or Store(cfg.data_dir)
+        self.vault = self.store.vault = Vault(cfg.vault_dir, cfg.tz, cfg.secrets)
         self.runner = runner or ClaudeRunner(cfg)
         self.garmin = GarminReader(cfg.garmin_db, cfg.garmin_profile)
         self.plan_lock = asyncio.Lock()
@@ -2590,6 +2781,13 @@ class Coach:
             if nxt:
                 parts.append(f"Next week's plan (already built):\n{nxt.strip()}")
         parts.extend(self.extra_context(now))
+        memory = self.vault.memory()
+        if memory:
+            parts.append(
+                "My gym vault, what you already did and learned (newest first). Use it: build on what I "
+                "lifted last time, account for what I skipped, and do not repeat advice it shows I already got:\n"
+                + memory
+            )
         return "\n\n".join(parts)
 
     # -- questions ------------------------------------------------------------
@@ -2606,6 +2804,7 @@ class Coach:
             message = question
         answer = clean_reply(await self.runner.run(self.system_prompt(), message, "ask"))
         self.store.add_memory(chat_id, question, answer[:3000], self.now())
+        self.vault.event("💬", "coach answered", f"{question[:100]} → {answer[:100]}")
         return answer
 
     # -- plans ----------------------------------------------------------------
@@ -3745,6 +3944,7 @@ def status_extra(coach: Coach) -> list[str]:
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     async with typing(context.bot, update.effective_chat.id):
         text = await status_text(coach_of(context), context.application)
+    coach_of(context).vault.event("📟", "/gymstatus answered", "; ".join(ln.strip("• ") for ln in text.splitlines()[1:3]))
     await reply(update, context, card("status", "Claude Code, sign in and reminders", text))
 
 
@@ -4013,6 +4213,7 @@ class SelfRepair:
         health["last_problem"] = {"at": now.isoformat(timespec="minutes"), "where": where, "signature": sig,
                                   "remedy": remedy, "diagnosis": diagnosis[:300]}
         self.save_health(health)
+        self.coach.vault.event("🩺", "self repair", f"{where} · {sig} · remedy {remedy} · {diagnosis[:150]}")
 
     async def apply(self, result: dict, job) -> tuple[str, bool]:
         """Carry out the chosen remedy. Returns (what was done, restart now)."""
@@ -4307,8 +4508,10 @@ async def send_day_session(context: ContextTypes.DEFAULT_TYPE, heading: str, res
     rest = bool(day and day.is_rest)
     note = coach.recovery_note(today, rest_day=rest)
     cards = coach.day_view(today, rest_heading if rest else heading, [note] if note else None) if day else None
+    sent = "rest day sent" if rest else "workout sent"
     if cards:
         await owner_send(context, cards, reply_markup=None if rest else alt_keyboard(today))
+        coach.vault.event("📨", sent, _visible(heading), workout_title(today))
         return
     markup = None
     if day is None:
@@ -4320,6 +4523,7 @@ async def send_day_session(context: ContextTypes.DEFAULT_TYPE, heading: str, res
     if note:
         blocks.append(to_html(note))
     await owner_send(context, blocks, reply_markup=markup)
+    coach.vault.event("📨", sent, _visible(heading), workout_title(today))
 
 
 async def on_alt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
