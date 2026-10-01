@@ -124,4 +124,4 @@ def test_week_split_rotates_the_upper_body_days():
     assert [bot.week_split(2)[d] for d in range(3)] == ["Back", "Shoulders", "Arms"]
     assert [bot.week_split(3)[d] for d in range(3)] == ["Shoulders", "Arms", "Chest"]
     assert bot.week_split(5) == bot.week_split(1)
-    assert bot.week_split(2)[3] == "Legs, then an easy run" and bot.week_split(2)[4] == "Run or swim"
+    assert bot.week_split(2)[3] == "Legs or run" and bot.week_split(2)[4] == "Run or swim"

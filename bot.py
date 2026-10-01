@@ -981,7 +981,7 @@ def week_split(week: int) -> dict[int, str]:
     """Monday to Wednesday: each body part moves one day earlier every week. Thursday and Friday stay."""
     n = len(UPPER_BODY_ROTATION)
     split = {d: UPPER_BODY_ROTATION[(d + week - 1) % n] for d in range(3)}
-    return split | {3: "Legs, then an easy run", 4: "Run or swim"}
+    return split | {3: "Legs or run", 4: "Run or swim"}
 
 
 def fmt_day(d: date) -> str:
@@ -1812,7 +1812,7 @@ Equipment in the office gym: {equipment}
 Schedule
 I am in the office Monday to Friday and train at the office gym after work: from {gym_mon_thu} Monday to Thursday and from {gym_fri} on Friday.
 Monday to Wednesday are upper body days split by body part, and the body part on each day rotates every week.
-Thursday is leg day, finished with a short easy run. Friday is running day, and I may swim instead of the run. No leg training on Friday.
+Thursday is legs or a run: I do one of them, never both. Friday is running day, and I may swim instead of the run. No leg training on Friday.
 {basketball}
 If I say I missed a session, adjust the rest of the week instead of doubling up. If I say I only have 20 or 30 minutes, give a shorter version of today's session.
 If I am on leave, travelling, or it is a public holiday, give a hotel gym or bodyweight version, or move the session.
@@ -1840,7 +1840,7 @@ How my plan works
 2. Every exercise changes each week as the main equipment rotates.
 3. Effort follows a 4 week wave: three building weeks, then a lighter deload week.
 4. For each training day: a 5 to 10 minute warm up, then each exercise with sets x reps, rest time, one short form cue and a video line, then a short cool down.
-5. On Thursday, finish the legs with an easy 10 to 20 minute run. For Friday's running day, give a run with distance or time and a target pace or effort. My running goals are 2.4 km under 12 minutes (5:00 per km) and 5 km under 35 minutes (7:00 per km); pick one each week and build toward it with a pace that fits my logged runs.
+5. On Thursday, give the leg session and a run I can do instead of it. For Friday's running day, give a run with distance or time and a target pace or effort. My running goals are 2.4 km under 12 minutes (5:00 per km) and 5 km under 35 minutes (7:00 per km); pick one each week and build toward it with a pace that fits my logged runs.
 6. For Friday, also give a swim session (duration and structure) that is safe for my shoulder, in case I swim instead of running.
 7. In the first week, add a short recovery note: sleep, rest days, and protein per day for my weight.
 
@@ -1971,7 +1971,7 @@ STRUCTURED_RULES = """How to fill in the plan. The bot lays it out for Telegram,
 1. Seven days, Monday to Sunday, in order. A rest day has rest_day true and a focus like "Rest or light mobility" or "Basketball or rest"; it may hold a short Mobility section.
 2. Group each training day into sections by body part, in training order: the main compound work first, then secondary and accessory work, then core, conditioning or the run. Name sections by body part, like Back, Chest, Shoulders, Arms, Legs, Glutes, Core, Court skills, Conditioning, Run, Swim or Mobility. On upper body days add a "Shoulder rehab" section.
 3. For every exercise give sets, reps (10, 8-10 or 30 s), load (a real starting weight in kg based on my logs, or bodyweight or light band), rest in seconds, effort as RPE that matches this week's effort, tempo, the muscles it trains, one short form cue, how my left arm does it (left_arm, only when the exercise uses the arms), YouTube search words for a form video (like "single arm cable row proper form") and a shoulder friendly swap. Pair two exercises as a superset with A1 and A2 in superset when that saves time.
-4. Thursday is legs, finished with a "Run" section holding a short easy run. Friday is the running day, with no leg training: a "Run" section with distance or time and pace, and a "Swim (instead of the run)" section.
+4. Thursday is legs or a run, never both: leg sections, then a "Run (instead of legs)" section with distance or time and pace. Friday is the running day, with no leg training: a "Run" section with distance or time and pace, and a "Swim (instead of the run)" section.
 5. Keep each day within my session time and put the total in minutes.
 6. warm_up and cool_down are short lists of steps. note is one or two short sentences for the day, or empty.
 7. notes are the week's general notes, one short sentence each.
