@@ -4,6 +4,9 @@ updated: 2026-10-02
 ---
 # Changelog
 ## 2026-10-02
+- feat: vault Activity notes live in year/month folders: `Activity/YYYY/MM/YYYY-MM-DD.md` (`Vault.event`, `_activity_notes`, `Home.md` names the current month folder). `Vault.migrate()` runs at start up and moves old flat `Activity/YYYY-MM-DD.md` notes into `YYYY/MM/` (never deletes; the owner's other notes stay). Memory reads the nested layout. Test: `test_flat_activity_notes_migrate_into_year_month_folders`.
+- chore: local main was 2 commits behind origin/main (card style + vault); the NAS copy of bot.py/compose.yaml/entrypoint.sh matched origin/main exactly, so nothing to fold in.
+## 2026-10-02
 - feat: Obsidian vault (NAS standard "movement log + memory") at `/volume1/<USER>/Obsidian/Gym Coach`, mounted at `/vault`, `VAULT_DIR` in `bot.env` (empty = off). `Vault` class in `bot.py`: `Activity/YYYY-MM-DD.md` gets `- HH:MM emoji **what** · detail · [[note]]` for plans saved, workouts sent/done/skipped, logs, shoulder ratings, `/coach` + `/gymstatus` answers and self repairs; `Workouts/<date> <Weekday>.md` (plan + `## History` of results) and `Exercises/<name>.md` (weight progression in `## History`); `Home.md` MOC. Hooks sit in `Store` (`add_log`, `set_session`, `add_rating`, `save_plan`), so every caller logs.
 - feat: memory. `Coach.system_prompt` appends `Vault.memory()`, a ~4,000 char excerpt, newest first (Activity up to 3/5 of it, then latest workouts and exercise progression), so plans, `/coach` and lighter/short sessions know the last lifts and skips.
 - Best effort: every vault method is wrapped by `best_effort` (logs a warning, returns ""); secrets are redacted; files chmod 664 / folders 775, chown to PUID/PGID when root; `entrypoint.sh` creates and chowns only the vault folder. Tests: `tests/test_vault.py`.
