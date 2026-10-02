@@ -19,7 +19,7 @@ def env(env, monkeypatch, tmp_path):
 
 
 def activity(cfg, day: str) -> list[str]:
-    path = cfg.data_dir.parent / "vault" / "Activity" / f"{day}.md"
+    path = cfg.data_dir.parent / "vault" / "Activity" / day[:4] / day[5:7] / f"{day}.md"
     return [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.startswith("- ")]
 
 
@@ -46,6 +46,7 @@ async def test_activity_lines_and_entity_history(app, cfg, clock):
     assert "🏋️ logged" in workout and "✅ done (via command)" in workout and "left shoulder 3/10" in workout
     home = (vault / "Home.md").read_text(encoding="utf-8")
     assert "[[2026-10-02]]" in home and "[[Row]]" in home and "[[2026-09-30 Wednesday]]" in home
+    assert "`Activity/2026/10/`" in home  # the current month folder
 
 
 async def test_memory_is_capped_newest_first_and_reaches_the_prompt(app, cfg, clock, claude):
@@ -96,7 +97,20 @@ def test_vault_off_without_vault_dir(tmp_path):
 def test_secrets_never_reach_the_vault(tmp_path, clock):
     vault = bot.Vault(tmp_path, clock.tz, ["sk-ant-oat01-SECRETSECRET"])
     line = vault.event("🩺", "self repair", "token sk-ant-oat01-SECRETSECRET leaked")
-    assert "SECRET" not in line and "SECRET" not in (tmp_path / "Activity" / "2026-09-30.md").read_text("utf-8")
+    assert "SECRET" not in line and "SECRET" not in (tmp_path / "Activity" / "2026" / "09" / "2026-09-30.md").read_text("utf-8")
+
+
+def test_flat_activity_notes_migrate_into_year_month_folders(tmp_path, clock):
+    old = tmp_path / "Activity"
+    old.mkdir()
+    (old / "2026-09-30.md").write_text("# old\n- 08:00 x **y**\n", encoding="utf-8")
+    (old / "notes.md").write_text("James's own note stays", encoding="utf-8")
+    vault = bot.Vault(tmp_path, clock.tz)  # migrates at start up
+    assert (old / "2026" / "09" / "2026-09-30.md").read_text(encoding="utf-8").startswith("# old")
+    assert not (old / "2026-09-30.md").exists() and (old / "notes.md").exists()
+    vault.event("📨", "workout sent")
+    assert "- 2026-09-30 08:00 x **y**" in vault.memory()  # old lines are still memory
+    assert "[[2026-09-30]]" in (tmp_path / "Home.md").read_text(encoding="utf-8")
 
 
 async def test_plan_writes_workout_notes_and_morning_send_is_logged(app, cfg, clock, claude):

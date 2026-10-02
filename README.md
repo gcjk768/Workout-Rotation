@@ -184,10 +184,12 @@ If the bot was off at a reminder time, it catches up when it starts. It sends a 
 
 With `VAULT_DIR=/vault` in `bot.env` and the vault volume in `compose.yaml` (`/volume1/James/Obsidian/Gym Coach`), the bot keeps an Obsidian vault:
 
-- `Activity/YYYY-MM-DD.md`: one line per event, `- HH:MM emoji **what** · detail · [[note]]` (Singapore time): plans saved, workouts sent, done or skipped, logs, shoulder ratings, `/coach` and `/gymstatus` answers, self repairs.
+- `Activity/YYYY/MM/YYYY-MM-DD.md`: one note per day in a year/month folder, one line per event, `- HH:MM emoji **what** · detail · [[note]]` (Singapore time): plans saved, workouts sent, done or skipped, logs, shoulder ratings, `/coach` and `/gymstatus` answers, self repairs.
 - `Workouts/YYYY-MM-DD Weekday.md`: that day's planned session, and a `## History` of what happened (logged, done, skipped, rating).
 - `Exercises/<name>.md`: every weight and reps you `/log`, in `## History` (the progression).
-- `Home.md`: links to the latest days, workouts and every exercise.
+- `Home.md`: the current month folder, links to the latest days, workouts and every exercise.
+
+Older flat `Activity/YYYY-MM-DD.md` notes are moved into `Activity/YYYY/MM/` when the bot starts (moved, never deleted).
 
 Before every Claude call (plans, `/coach`, lighter or shorter sessions) the bot passes a capped excerpt (about 4,000 characters, newest first) of the recent Activity, workouts and exercise progression, so the coach knows what you lifted last time and what you skipped. History sections are append only; everything else is safe to edit. Vault errors are only logged, the bot carries on. No tokens or full prompts are written there.
 

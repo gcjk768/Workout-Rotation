@@ -758,8 +758,8 @@ def _take(lines: list[str], budget: int) -> list[str]:
 
 
 class Vault:
-    """The Obsidian vault at VAULT_DIR (NAS vault standard): Activity/YYYY-MM-DD.md is the
-    movement log, Workouts/ and Exercises/ are entity notes with an append-only ## History,
+    """The Obsidian vault at VAULT_DIR (NAS vault standard): Activity/YYYY/MM/YYYY-MM-DD.md is
+    the movement log, Workouts/ and Exercises/ are entity notes with an append-only ## History,
     Home.md is the map. memory() reads it back into every Claude prompt. Best effort only:
     every public method logs and returns "" on any error, and does nothing without VAULT_DIR."""
 
@@ -767,6 +767,7 @@ class Vault:
         self.root = Path(root) if root else None
         self.tz = tz
         self.secrets = secrets or []
+        self.migrate()
 
     # -- files ------------------------------------------------------------------
 
@@ -777,11 +778,32 @@ class Vault:
             os.chown(path, int(os.environ.get("PUID") or 1000), int(os.environ.get("PGID") or 1000))
 
     def _dir(self, name: str) -> Path:
-        path = self.root / name
-        if not path.is_dir():
-            path.mkdir(parents=True, exist_ok=True)
-            self._own(path)
+        """root/name (nested names allowed), every missing level created and owned."""
+        path = self.root
+        for part in ("", *Path(name).parts):
+            path = path / part
+            if not path.is_dir():
+                path.mkdir(parents=True, exist_ok=True)
+                self._own(path)
         return path
+
+    def _activity_notes(self) -> list[Path]:
+        """Every Activity day note, newest first (Activity/YYYY/MM/YYYY-MM-DD.md)."""
+        return sorted((self.root / "Activity").rglob("????-??-??.md"), key=lambda p: p.stem, reverse=True)
+
+    @best_effort
+    def migrate(self) -> str:
+        """Move the old flat Activity/YYYY-MM-DD.md notes into Activity/YYYY/MM/ (never deletes)."""
+        moved = []
+        for old in sorted((self.root / "Activity").glob("????-??-??.md")):
+            new = self._dir(f"Activity/{old.stem[:4]}/{old.stem[5:7]}") / old.name
+            if not new.exists():
+                os.replace(old, new)
+                moved.append(old.stem)
+        if moved:
+            log.info("Vault: moved %d Activity notes into YYYY/MM folders", len(moved))
+            self.home()
+        return " ".join(moved)
 
     def _write(self, path: Path, text: str) -> None:
         tmp = path.with_name(path.name + ".tmp")
@@ -799,7 +821,7 @@ class Vault:
     def event(self, emoji: str, what: str, detail: str = "", link: str = "") -> str:
         """One line in today's Activity note: - HH:MM emoji **what** · detail · [[link]] (local time)."""
         now = now_in(self.tz)
-        path = self._dir("Activity") / f"{now.date().isoformat()}.md"
+        path = self._dir(f"Activity/{now:%Y/%m}") / f"{now.date().isoformat()}.md"
         line = " · ".join(p for p in (f"- {now:%H:%M} {emoji} **{what}**", self._clean(detail),
                                       f"[[{link}]]" if link else "") if p)
         new = not path.exists()
@@ -835,15 +857,19 @@ class Vault:
 
     @best_effort
     def home(self) -> str:
-        """Home.md, the map of contents: the latest Activity days and workouts, every exercise."""
+        """Home.md, the map of contents: this month's Activity folder and the latest days, the
+        latest workouts, every exercise."""
         def links(folder: str, newest: bool, limit: int | None = None) -> str:
             names = sorted((p.stem for p in (self.root / folder).glob("*.md")), reverse=newest)[:limit]
             return "\n".join(f"- [[{n}]]" for n in names) or "- none yet"
-        text = (f"---\ntags: [active]\nupdated: {now_in(self.tz).date().isoformat()}\n---\n# Gym Coach\n"
+        now = now_in(self.tz)
+        days = "\n".join(f"- [[{p.stem}]]" for p in self._activity_notes()[:14]) or "- none yet"
+        text = (f"---\ntags: [active]\nupdated: {now.date().isoformat()}\n---\n# Gym Coach\n"
                 "Movement log and memory of the gym coach bot (`gym-coach-bot` on the NAS). The bot writes "
                 "here and reads Activity, Workouts and Exercises back before every Claude call, so the coach "
                 "knows what you lifted and what you skipped. Safe to edit; History sections are append only.\n\n"
-                f"## Activity (latest days)\n{links('Activity', True, 14)}\n\n"
+                f"## Activity\nThis month: `Activity/{now:%Y/%m}/` (one note per day, `Activity/YYYY/MM/YYYY-MM-DD.md`).\n"
+                f"Latest days:\n{days}\n\n"
                 f"## Workouts (latest)\n{links('Workouts', True, 14)}\n\n"
                 f"## Exercises\n{links('Exercises', False)}\n")
         self._write(self.root / "Home.md", text)
@@ -887,7 +913,7 @@ class Vault:
         """A capped excerpt, newest first: recent Activity lines (up to 3/5 of the cap), then the
         latest workouts with their results and the recently trained exercises' progression."""
         lines = ["Recent activity (newest first):"]
-        for path in sorted((self.root / "Activity").glob("*.md"), reverse=True)[:7]:
+        for path in self._activity_notes()[:7]:
             events = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.startswith("- ")]
             lines += [f"- {path.stem} {ln[2:]}" for ln in reversed(events)]
         lines = _take(lines, limit * 3 // 5)
