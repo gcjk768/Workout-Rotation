@@ -82,7 +82,7 @@ In the JSON reply, `"is_error": false` and a `result` text mean everything works
 
 | Command | What it does |
 |---|---|
-| `/coach <question>` | Ask the coach (`/ask` works too). In a private chat, a plain message works too. It remembers your last 6 questions. |
+| `/coach <question>` | Ask the coach (`/ask` and `/ask_coach` work too). In a private chat, a plain message works too. It remembers your last 6 questions. |
 | `/today` | Today's workout card (see "Workout cards" below) |
 | `/day <day>` | Any day's workout card, for example `/day fri`. Once a day has passed and next week is built, it shows next week's. |
 | `/week` | The week in short: each day's body parts with sets, reps and weights. On Saturday and Sunday it shows next week's if it's built. |
