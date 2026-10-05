@@ -4419,7 +4419,7 @@ def add_handlers(application: Application, concurrent: bool = True) -> None:
     slow = {"block": not concurrent}
     application.add_handler(CommandHandler(["start", "help"], cmd_start))
     application.add_handler(CommandHandler("whoami", cmd_whoami))
-    application.add_handler(CommandHandler(["coach", "ask"], cmd_ask, **slow))
+    application.add_handler(CommandHandler(["coach", "ask", "ask_coach"], cmd_ask, **slow))
     application.add_handler(CommandHandler("today", cmd_today))
     application.add_handler(CommandHandler("week", cmd_week))
     application.add_handler(CommandHandler("day", cmd_day))
