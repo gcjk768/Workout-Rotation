@@ -28,3 +28,9 @@ services:
         max-size: "10m"
         max-file: "3"
     mem_limit: 1g   # python plus one or two claude -p calls at a time
+    healthcheck:   # the check imports the whole bot; give it room when the NAS is under heavy load
+      test: ["CMD", "python", "/app/bot.py", "--health"]
+      interval: 60s
+      timeout: 120s
+      start_period: 90s
+      retries: 3
