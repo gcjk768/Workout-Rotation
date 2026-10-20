@@ -12,7 +12,10 @@ services:
     init: true   # reaps helper processes that claude -p leaves behind
     stop_grace_period: 30s   # time to finish a reply before `docker compose down` stops it
     env_file: bot.env
+    environment:
+      PATH: "/fb:/home/coach/.local/bin:/root/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     volumes:
+      - /volume1/docker/claude-fallback:/fb:ro   # claude -p fallback wrapper (API key -> subscription); /fb is first on PATH
       # Plans, logs, shoulder ratings, check ins and chat memory. Include it in your NAS backups.
       - ./data:/data
       # garmin-monitor's data folder, read only. The bot reads monitor.db from it.
