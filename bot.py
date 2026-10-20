@@ -2019,7 +2019,7 @@ I have a left shoulder injury with a micro tear, and I have no strength in that 
 9. If I mention sharp or worsening pain, pain at night, numbness or tingling, or a sudden loss of strength, tell me to stop and see a doctor or physio. You are a coach, not my doctor.
 
 Basketball
-Where it fits, include work that carries over to the court: jumping and landing, lateral quickness and footwork, single leg strength, core and anti rotation work, ankle and knee stability, and short conditioning intervals. Build jump volume up slowly.
+Do not add court skills (jumping, footwork, plyometrics) to the daily workout.
 
 Recovery and progress
 Use my workout logs to set my weights and progress me week to week. If my Garmin data shows poor recovery (short sleep, low body battery, or HRV below my usual), make today lighter. Count my logged runs toward my weekly running.
@@ -2158,10 +2158,10 @@ PLAN_SCHEMA = {
 }
 STRUCTURED_RULES = """How to fill in the plan. The bot lays it out for Telegram, so write plain words in every field (no markdown, no emojis):
 1. Seven days, Monday to Sunday, in order. A rest day has rest_day true and a focus like "Rest or light mobility" or "Basketball or rest"; it may hold a short Mobility section.
-2. Group each training day into sections by body part, in training order: the main compound work first, then secondary and accessory work, then core, conditioning or the run. Name sections by body part, like Back, Chest, Shoulders, Arms, Legs, Glutes, Core, Court skills, Conditioning, Run, Swim or Mobility. On upper body days add a "Shoulder rehab" section.
+2. Group each training day into sections by body part, in training order: the main compound work first, then secondary and accessory work, then core, conditioning or the run. Name sections by body part, like Back, Chest, Shoulders, Arms, Legs, Glutes, Core, Conditioning, Run, Swim or Mobility. On upper body days add a "Shoulder rehab" section.
 3. For every exercise give sets, reps (10, 8-10 or 30 s), load (a real starting weight in kg based on my logs, or bodyweight or light band), rest in seconds, effort as RPE that matches this week's effort, tempo, the muscles it trains, one short form cue, how my left arm does it (left_arm, only when the exercise uses the arms), YouTube search words for a form video (like "single arm cable row proper form") and a shoulder friendly swap. Pair two exercises as a superset with A1 and A2 in superset when that saves time.
 4. Thursday is legs or a run, never both: leg sections, then a "Run (instead of legs)" section with distance or time and pace. Friday is the running day, with no leg training: a "Run" section with distance or time and pace, and a "Swim (instead of the run)" section.
-5. Keep each day within my session time and put the total in minutes.
+5. Keep each training day between 45 and 60 minutes, warm up and cool down included, and put the total in minutes. Give each exercise 3 to 5 sets. I mostly do 3 heavy sets, so default to 3 sets of heavy weights on the main lifts and use 4 or 5 only when it earns its place.
 6. warm_up and cool_down are short lists of steps. note is one or two short sentences for the day, or empty.
 7. notes are the week's general notes, one short sentence each.
 8. The video field holds only the search words, without [yt: ]. Write no dashes; use commas instead.
@@ -2171,7 +2171,7 @@ DAY_SCHEMA = PLAN_SCHEMA["properties"]["days"]["items"]
 DAY_RULES = """How to fill in the session. The bot lays it out for Telegram, so write plain words in every field (no markdown, no emojis):
 1. Group the exercises into sections by body part, in training order, like the plan. Keep a "Shoulder rehab" section on upper body days.
 2. For every exercise give sets, reps, load (a real weight in kg, or bodyweight or light band), rest in seconds, effort as RPE, tempo, the muscles it trains, one short form cue, how my left arm does it (left_arm, only when the exercise uses the arms), YouTube search words for a form video and a shoulder friendly swap.
-3. Put the new total time in minutes. warm_up and cool_down are short lists of steps. note is one or two short sentences on what changed, or empty.
+3. Keep the session between 45 and 60 minutes with 3 to 5 sets per exercise (3 heavy sets is the default). Put the new total time in minutes. warm_up and cool_down are short lists of steps. note is one or two short sentences on what changed, or empty.
 4. The video field holds only the search words, without [yt: ]. Write no dashes; use commas instead."""
 
 _PLAN_TEXT_FIELDS = ("name", "superset", "reps", "load", "effort", "tempo", "muscles", "cue", "left_arm", "video", "swap")
@@ -3692,8 +3692,6 @@ async def on_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         with contextlib.suppress(BadRequest):
             await query.edit_message_text(f"{header('done', fmt_day(day))}\n\nMarked as done. Nice work.",
                                           parse_mode=ParseMode.HTML)
-        await send_view(context.bot, chat_id, card("shoulder", "how does it feel?", RATING_QUESTION),
-                        reply_markup=rating_keyboard(day))
         return
     with contextlib.suppress(BadRequest):
         await query.edit_message_text(f"{header('skipped', fmt_day(day))}\n\nMarked as skipped.",

@@ -241,8 +241,7 @@ async def test_evening_check_buttons_and_done(app, claude, clock):
     calls = await press(app, "chk:2026-09-30:done")
     edits = [p["text"] for n, p in calls if n == "editMessageText"]
     assert edits == ["✅ <b>SESSION DONE</b> · Wed 30 Sep\n\nMarked as done. Nice work."]
-    rating_msg = [p for n, p in calls if n == "sendMessage"][0]
-    assert keyboard_data(rating_msg)[0] == "rate:2026-09-30:0"
+    assert [n for n, _ in calls if n == "sendMessage"] == []  # no extra rating card after Done
     assert app.bot_data["coach"].store.sessions()["2026-09-30"]["status"] == "done"
     app.tg.clear()
     await bot.job_evening_check(job_context(app))
