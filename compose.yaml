@@ -24,7 +24,7 @@ services:
       - /volume1/docker/garmin-monitor/data:/garmin:ro
       # FoodLens's data folder, read only. The bot reads foodlens.db from it for /food
       # (calories and protein from the meals logged in the FoodLens bot). Without it /food says so.
-      - /volume1/docker/foodlens/data:/foodlens:ro
+      - /volume1/docker/foodlens-james/data:/foodlens:ro
       # Obsidian vault: the movement log (Activity/) and memory (Workouts/, Exercises/).
       # Set VAULT_DIR=/vault in bot.env; leave VAULT_DIR empty to turn it off.
       - "/volume1/<USER>/Obsidian/Gym Coach:/vault"
