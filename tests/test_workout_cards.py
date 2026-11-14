@@ -258,7 +258,7 @@ async def test_morning_message_is_the_card_with_buttons(app, claude, clock):
     assert messages[0]["text"].startswith("☀️ <b>GOOD MORNING</b> · Today's workout\n\n📅 <b>THURSDAY 1 OCT")
     markup = json.loads(messages[-1]["reply_markup"]) if isinstance(messages[-1]["reply_markup"], str) else messages[-1]["reply_markup"]
     data = [b["callback_data"] for row in markup["inline_keyboard"] for b in row]
-    assert data == ["alt:2026-10-01:light", "alt:2026-10-01:short"]
+    assert data == ["alt:2026-10-01:light", "alt:2026-10-01:short", "swp:2026-10-01:menu", "off:2026-10-01:sick"]
     clock.set(2026, 10, 4, 7, 0)  # Sunday, a rest day
     before = len(app.tg.sent())
     await bot.job_daily_workout(ctx(app))

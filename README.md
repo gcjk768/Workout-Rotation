@@ -8,6 +8,9 @@ A private Telegram bot that coaches you like a personal trainer. It runs in Dock
 - Sends that day's workout every morning, with buttons for a lighter or a 30-minute version. It reminds you again before the gym and checks at 9pm whether you trained. On Sunday it asks how the week went, then builds next week's plan from your answer.
 - Reads your sleep, resting heart rate, HRV, body battery, runs and workouts from your garmin-monitor app. It warns you when your recovery looks low, and marks the day done when your watch recorded a workout.
 - Knows Singapore public holidays and the days you're away (`/away`), and plans a hotel gym or bodyweight version for them.
+- Leaves you alone when you're sick or off (`/sick`, `/off`): those days are rest, with no reminders, and they don't count as skipped. Your first session back after being sick comes with a note to go lighter.
+- Lets you change the week yourself: `/swap arms` makes today arms (the day that had arms takes today's session), and `/add sat arms` puts a session on a rest day.
+- Reads the calories and protein you log in your FoodLens bot (`/food`) and uses them when it advises you.
 - Tracks the weights you log (`/progress`), sends your shoulder ratings as a spreadsheet file for your physio, and adds "last week in numbers" to the Sunday overview.
 
 ## How it fits together
@@ -94,6 +97,10 @@ In the JSON reply, `"is_error": false` and a `result` text mean everything works
 | `/progress` | The weights and reps from your logs, per exercise, first to latest |
 | `/injury [notes]` | Show or replace your injury notes. `/injury none` clears them. |
 | `/away [dates] [note]` | Days away, on leave or travelling, for example `/away 8 Oct to 10 Oct Bangkok trip` or `/away thu fri`. `/away` lists them with upcoming public holidays, and `/away clear` removes them. |
+| `/sick [dates]` · `/off [dates] [note]` | Days with no training at all. `/sick` is today, `/sick 3` is three days from today, `/sick mon to wed` or `/off 20 Dec to 2 Jan holiday` a range. No workout card, no reminder before the gym and no evening question on those days, and they are not counted as skipped. After `/sick`, the first session back gets a note to use the lighter version. `/sick clear` ends it early. The morning card also has a 🤒 **Sick today** button |
+| `/swap [what]` | Change today's workout. `/swap arms`: if a later day this week has arms, the two days trade places, so nothing is lost; if not, the coach writes an arms session for today. `/swap fri` trades today with Friday (use a rest day, like `/swap sat`, to move today's session there). `/swap tue thu` trades two later days. `/swap` alone, or the 🔁 **Swap workout** button on the morning card, shows the choices as buttons |
+| `/add <day> [body part]` | A full session on a rest day or a skipped day, like `/add sat arms` or `/add sun legs`. With no body part it takes the upper body part that sits out this week |
+| `/food` | Today's calories and protein from FoodLens against your targets, the last 7 days and the average. The calorie target is FoodLens's; the protein target is `FOOD_PROTEIN_PER_KG` (1.6 g) times `WEIGHT_KG`. Days you did not log are left out, not counted as zero |
 | `/profile` | What the coach knows about you, including your shoulder trend and Garmin data |
 | `/gymstatus` | (`/status` works too) Claude Code version, sign-in, the last plan built and the next reminders |
 | `/reset` | Clear the chat memory |

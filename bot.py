@@ -326,6 +326,8 @@ class Config:
     holidays_country: str = "SG"
     safety_review: bool = True
     structured_plans: bool = True
+    foodlens_db: str = "/foodlens/foodlens.db"  # FoodLens's database, mounted read only
+    protein_per_kg: float = 1.6  # protein target for training, grams per kg of body weight
     self_repair: bool = True
     repair_alert_chat: tuple[int, int | None] | None = None  # (chat, topic) that also gets 🩺 alerts
     bot_chat: tuple[int, int | None] | None = None  # (group, topic) the bot lives in, instead of the owner's DM
@@ -414,6 +416,8 @@ class Config:
             holidays_country=get("HOLIDAYS_COUNTRY", "SG") if "HOLIDAYS_COUNTRY" not in env else _clean(env["HOLIDAYS_COUNTRY"]),
             safety_review=parse_switch(env.get("SAFETY_REVIEW"), True),
             structured_plans=parse_switch(env.get("STRUCTURED_PLANS"), True),
+            foodlens_db=get("FOODLENS_DB", "/foodlens/foodlens.db"),
+            protein_per_kg=_float(env.get("FOOD_PROTEIN_PER_KG"), 1.6),
             self_repair=parse_switch(env.get("SELF_REPAIR"), True),
             repair_alert_chat=parse_chat(env.get("REPAIR_ALERT_CHAT")),
             bot_chat=parse_chat(env.get("BOT_CHAT"), "BOT_CHAT"),
@@ -897,7 +901,7 @@ class Vault:
                       body=f"# {name}\nWeights and reps from /log. History is the progression, oldest first.")
 
     def session(self, day: date, status: str, source: str) -> None:
-        emoji = "✅" if status == "done" else "⏭️"
+        emoji = {"done": "✅", "off": "🛌"}.get(status, "⏭️")
         self.event(emoji, f"workout {status}", f"{fmt_day(day)} · via {source}", workout_title(day))
         self.note("Workouts", workout_title(day), f"{emoji} {status} (via {source})")
 
@@ -2305,6 +2309,83 @@ def _h(text: str) -> str:
 # The card style every message uses: a header line, one block per item, a divider
 # between big groups and background folded into an expandable quote at the end.
 DIVIDER = "━━━━━━━━━━━━━━━━"
+def _float(value, default: float) -> float:
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+# Days with no training at all (unlike /away, which plans a hotel gym or bodyweight version).
+REST_KINDS = {  # kind -> (emoji, label for the plan request)
+    "sick": ("🤒", "sick, full rest with no training"),
+    "off": ("🏖", "day off, full rest with no training"),
+}
+SWAP_PARTS = ["Chest", "Back", "Shoulders", "Arms", "Legs", "Core"]
+FOOD_KEYS = ("kcal", "protein_g", "carbs_g", "fat_g")
+FOOD_DEFAULT = {"kcal": 2000, "protein_g": 60}  # FoodLens's own defaults until /setup is done there
+
+
+class FoodReader(GarminReader):
+    """Reads FoodLens's SQLite database (the meals logged in the FoodLens bot) without ever
+    writing to it. Same read only open as the Garmin reader."""
+
+    def __init__(self, path: str):
+        super().__init__(path, "")
+
+    def ok(self) -> bool:
+        return Path(self.path).is_file()
+
+    def days(self, start: date, end: date) -> dict[str, dict]:
+        """{"2026-11-14": {"meals": 3, "kcal": 1850.0, ...}} for days with a logged meal.
+        Empty when the database is missing or unreadable: food never breaks a reminder."""
+        try:
+            rows = self._query(
+                "SELECT m.day AS day, m.id AS meal, i.nutrients AS nutrients FROM meal m "
+                "JOIN meal_item i ON i.meal_id = m.id WHERE m.status = 'logged' AND m.day >= ? AND m.day <= ?",
+                (start.isoformat(), end.isoformat()),
+            )
+        except (FileNotFoundError, sqlite3.Error):
+            return {}
+        out: dict[str, dict] = {}
+        for row in rows:
+            day = out.setdefault(str(row["day"])[:10], {"meals": set(), **{k: 0.0 for k in FOOD_KEYS}})
+            day["meals"].add(row["meal"])
+            try:
+                nutrients = json.loads(row["nutrients"]) if isinstance(row["nutrients"], str) else row["nutrients"]
+            except ValueError:
+                continue
+            for key in FOOD_KEYS:
+                day[key] += _float((nutrients or {}).get(key), 0.0)
+        return {day: {**totals, "meals": len(totals["meals"])} for day, totals in out.items()}
+
+    def targets(self) -> dict:
+        """Daily kcal and protein targets as FoodLens shows them."""
+        try:
+            rows = self._query("SELECT sex, age, height_cm, weight_kg, activity, goal, overrides FROM profile ORDER BY id LIMIT 1")
+        except (FileNotFoundError, sqlite3.Error):
+            return dict(FOOD_DEFAULT)
+        if not rows:
+            return dict(FOOD_DEFAULT)
+        pr = dict(rows[0])
+        # ponytail: FoodLens's formula (foodlens/targets.py, Mifflin-St Jeor) copied for kcal and protein only.
+        # If FoodLens changes it, the two drift; read its numbers from a shared file then.
+        male = pr["sex"] == "male"
+        base = 10 * pr["weight_kg"] + 6.25 * pr["height_cm"] - 5 * pr["age"] + (5 if male else -161)
+        activity = {"sedentary": 1.2, "light": 1.375, "moderate": 1.55, "active": 1.725, "very_active": 1.9}
+        kcal = max(base * activity.get(pr["activity"], 1.2) + {"lose": -500, "gain": 300}.get(pr["goal"], 0),
+                   1500 if male else 1200)
+        out = {"kcal": round(kcal), "protein_g": round({"lose": 1.2, "gain": 1.4}.get(pr["goal"], 1.0) * pr["weight_kg"])}
+        try:
+            overrides = json.loads(pr["overrides"]) if isinstance(pr["overrides"], str) else pr["overrides"]
+        except ValueError:
+            overrides = {}
+        for key in out:
+            if isinstance((overrides or {}).get(key), (int, float)):
+                out[key] = round(overrides[key])
+        return out
+
+
 SECTION_TITLES = {  # message type -> (fixed emoji, TITLE)
     "help": ("💪", "GYM COACH"),
     "whoami": ("🪪", "YOUR ID"),
@@ -2326,6 +2407,10 @@ SECTION_TITLES = {  # message type -> (fixed emoji, TITLE)
     "checkin": ("📋", "WEEKLY CHECK IN"),
     "injury": ("🤕", "INJURY NOTES"),
     "away": ("✈️", "DAYS AWAY"),
+    "rest": ("🛌", "REST DAYS"),
+    "swap": ("🔁", "SWAP WORKOUT"),
+    "add": ("➕", "EXTRA WORKOUT"),
+    "food": ("🍽", "FOOD INTAKE"),
     "memory": ("🧹", "CHAT MEMORY"),
     "profile": ("👤", "PROFILE"),
     "status": ("🩺", "GYM STATUS"),
@@ -2589,6 +2674,7 @@ class Coach:
         self.vault = self.store.vault = Vault(cfg.vault_dir, cfg.tz, cfg.secrets)
         self.runner = runner or ClaudeRunner(cfg)
         self.garmin = GarminReader(cfg.garmin_db, cfg.garmin_profile)
+        self.food = FoodReader(cfg.foodlens_db)
         self.plan_lock = asyncio.Lock()
 
     # -- time and weeks -----------------------------------------------------
@@ -2665,12 +2751,15 @@ class Coach:
         stats = self.garmin.week_stats(monday, sunday)
         if stats:
             lines += [f"• {line}" for line in stats]
+        food = self.food_average(monday, sunday)
+        if food:
+            lines.append(f"• Food (FoodLens): {food}")
         return "\n".join(lines)
 
     def extra_context(self, now: datetime) -> list[str]:
         today = now.date()
         since = today - timedelta(days=13)
-        parts = []
+        parts = [line for line in (self.sick_context(today), self.food_context(today)) if line]
         week = self.week_sessions_text(monday_of(today))
         parts.append(
             f"Sessions this week so far: {week}." if week else "Sessions this week so far: none marked done or skipped yet."
@@ -2723,10 +2812,135 @@ class Coach:
         return public_holiday(self.cfg.holidays_country, day)
 
     def away_on(self, day: date) -> dict | None:
-        for period in self.store.away():
-            if period["start"] <= day.isoformat() <= period["end"]:
-                return period
-        return None
+        hits = [p for p in self.store.away() if p["start"] <= day.isoformat() <= p["end"]]
+        return next((p for p in hits if p.get("kind") in REST_KINDS), hits[0] if hits else None)
+
+    # -- sick days and days off: full rest, no reminders ----------------------
+
+    def rest_on(self, day: date) -> dict | None:
+        """The sick or day off period that covers this day, if any."""
+        period = self.away_on(day)
+        return period if period and period.get("kind") in REST_KINDS else None
+
+    def add_rest(self, start: date, end: date, kind: str, note: str = "") -> None:
+        today = self.today()
+        keep = (today - timedelta(days=14)).isoformat()  # recent sick days stay, for the ease back in
+        periods = [p for p in self.store.away() if p["end"] >= keep]
+        periods.append({"start": start.isoformat(), "end": end.isoformat(), "note": note, "kind": kind})
+        self.store.set_away(periods)
+        if start <= today <= end and self.store.sessions().get(today.isoformat(), {}).get("status") != "done":
+            self.store.set_session(today, "off", self.now(), kind)
+
+    def clear_rest(self) -> None:
+        """Back on my feet: rest days from today on are removed, earlier ones are kept as history."""
+        today = self.today()
+        yesterday = (today - timedelta(days=1)).isoformat()
+        periods = []
+        for p in self.store.away():
+            if p.get("kind") not in REST_KINDS or p["end"] < today.isoformat():
+                periods.append(p)
+            elif p["start"] < today.isoformat():
+                periods.append({**p, "end": yesterday})
+        self.store.set_away(periods)
+        sessions = self.store.sessions()
+        if sessions.get(today.isoformat(), {}).get("status") == "off":
+            sessions.pop(today.isoformat())
+            self.store.write_json("sessions.json", sessions)
+
+    def sick_until(self, start: date, end: date) -> date | None:
+        """The last sick day between two dates."""
+        ends = [date.fromisoformat(p["end"]) for p in self.store.away() if p.get("kind") == "sick"]
+        ends = [e for e in ends if start <= e <= end]
+        return max(ends) if ends else None
+
+    def back_note(self, today: date) -> str | None:
+        """For the first session after being sick."""
+        last = self.sick_until(today - timedelta(days=3), today - timedelta(days=1))
+        if not last:
+            return None
+        sessions = self.store.sessions()
+        if any(v.get("status") == "done" and k > last.isoformat() for k, v in sessions.items()):
+            return None
+        return f"🤒 First session back after being sick (until {fmt_day(last)}): go easy and use the 🪶 Lighter version."
+
+    def sick_context(self, today: date) -> str | None:
+        now_sick = self.rest_on(today)
+        if now_sick and now_sick.get("kind") == "sick":
+            return (f"I am sick, from {fmt_day(date.fromisoformat(now_sick['start']))} to "
+                    f"{fmt_day(date.fromisoformat(now_sick['end']))}. Do not ask me to train on those days.")
+        last = self.sick_until(today - timedelta(days=7), today - timedelta(days=1))
+        return (f"I was sick until {fmt_day(last)}. Ease me back in: keep my first two sessions back lighter, "
+                "about RPE 5 to 6.") if last else None
+
+    # -- food from FoodLens ----------------------------------------------------
+
+    def food_targets(self) -> dict:
+        targets = self.food.targets()
+        weight = _float(self.cfg.weight_kg, 0.0)
+        if weight > 0:  # training needs more protein than FoodLens's everyday target
+            targets["protein_g"] = max(targets["protein_g"], round(self.cfg.protein_per_kg * weight))
+        return targets
+
+    @staticmethod
+    def _food_text(day: dict, targets: dict) -> str:
+        meals = f"{day['meals']} meal" + ("s" if day["meals"] != 1 else "")
+        return (f"{day['kcal']:,.0f} of {targets['kcal']:,} kcal · protein {day['protein_g']:.0f} of "
+                f"{targets['protein_g']} g · {meals}")
+
+    def food_line(self, day: date) -> str | None:
+        """One line for a card, or None when nothing was logged that day."""
+        found = self.food.days(day, day).get(day.isoformat())
+        return f"🍽 Food logged: {self._food_text(found, self.food_targets())}" if found else None
+
+    def food_days(self, start: date, end: date) -> list[tuple[date, dict]]:
+        days = self.food.days(start, end)
+        return [(date.fromisoformat(k), days[k]) for k in sorted(days)]
+
+    def food_average(self, start: date, end: date) -> str | None:
+        days = self.food_days(start, end)
+        if not days:
+            return None
+        n = len(days)
+        targets = self.food_targets()
+        kcal = sum(d["kcal"] for _, d in days) / n
+        protein = sum(d["protein_g"] for _, d in days) / n
+        return (f"{n} day{'s' if n != 1 else ''} logged, average {kcal:,.0f} kcal and {protein:.0f} g protein a day "
+                f"(targets {targets['kcal']:,} kcal, {targets['protein_g']} g)")
+
+    def food_context(self, today: date) -> str | None:
+        days = self.food_days(today - timedelta(days=6), today)
+        if not days:
+            return None
+        targets = self.food_targets()
+        lines = [f"{fmt_day(d)}: {t['kcal']:.0f} kcal, {t['protein_g']:.0f} g protein, {t['carbs_g']:.0f} g carbs, "
+                 f"{t['fat_g']:.0f} g fat, {t['meals']} meals logged" for d, t in days]
+        return ("My food from my FoodLens tracker, last 7 days (targets "
+                f"{targets['kcal']} kcal and {targets['protein_g']} g protein a day). A day that is not listed "
+                "was not logged, it does not mean I ate nothing. Today may be incomplete:\n" + "\n".join(lines))
+
+    def food_view(self) -> list[str]:
+        today = self.today()
+        if not self.food.ok():
+            return card("food", "", "I cannot read FoodLens's database.",
+                        hint=f"Check that FoodLens's data folder is mounted so {self.cfg.foodlens_db} exists.")
+        targets = self.food_targets()
+        days = self.food_days(today - timedelta(days=6), today)
+        aim = f"🎯 **Targets** · {targets['kcal']:,} kcal · protein {targets['protein_g']} g a day"
+        if not days:
+            return card("food", "nothing logged", "No meals logged in FoodLens in the last 7 days.", aim,
+                        hint="Send a meal photo or a line of text to your FoodLens bot. The numbers show up here.")
+        found = dict(days).get(today)
+        now = "📅 **Today** · " + (self._food_text(found, targets) if found else "nothing logged yet")
+        week = "🗓 **Last 7 days**\n" + "\n".join(
+            f"• {fmt_day(d)}: {t['kcal']:,.0f} kcal · protein {t['protein_g']:.0f} g · {t['meals']} meals" for d, t in days)
+        average = self.food_average(today - timedelta(days=6), today)
+        left = ""
+        if found:
+            gap = targets["protein_g"] - found["protein_g"]
+            left = (f"💪 About {gap:.0f} g of protein to go today." if gap > 5 else "💪 Protein target reached today.")
+        parts = [now, *([left] if left else []), week, f"📊 {average[:1].upper()}{average[1:]}.", aim]
+        return card("food", fmt_day(today), *parts,
+                    hint="Numbers come from the meals you log in FoodLens. A day with no entry was not logged.")
 
     def days_off(self, start: date, end: date) -> list[tuple[date, str]]:
         """Days away or public holidays between two dates, with a short label."""
@@ -2736,7 +2950,8 @@ class Coach:
             away = self.away_on(day)
             holiday = self.holiday(day)
             if away:
-                out.append((day, "away" + (f" ({away['note']})" if away.get("note") else "")))
+                label = REST_KINDS.get(away.get("kind"), ("", "away"))[1]
+                out.append((day, label + (f" ({away['note']})" if away.get("note") else "")))
             elif holiday:
                 out.append((day, f"public holiday ({holiday})"))
             day += timedelta(days=1)
@@ -2744,6 +2959,10 @@ class Coach:
 
     def day_off_line(self, day: date) -> str | None:
         away = self.away_on(day)
+        if away and away.get("kind") in REST_KINDS:
+            what = "Sick day" if away["kind"] == "sick" else "Day off"
+            note = f" ({away['note']})" if away.get("note") else ""
+            return f"{REST_KINDS[away['kind']][0]} {what} today{note}: rest, no training."
         if away:
             return "✈️ You are away today" + (f" ({away['note']})" if away.get("note") else "") + "."
         holiday = self.holiday(day)
@@ -2917,6 +3136,11 @@ class Coach:
                 "the session, as your rules say:",
                 *[f"{fmt_day(d)}: {label}" for d, label in off],
             ]
+            if any("full rest" in label for _, label in off):
+                lines.append("Where a day says full rest, plan a rest day with no training at all.")
+        back = self.sick_until(monday - timedelta(days=7), sunday)
+        if back:
+            lines += ["", f"I was sick until {fmt_day(back)}. Make my first two sessions after that lighter, about RPE 5 to 6."]
         if notes.strip():
             lines += ["", f"My notes for this plan: {notes.strip()}"]
         lines += ["", self.format_rules(structured)]
@@ -3154,6 +3378,19 @@ class Coach:
         request = "\n".join([question, how, f"Return only this one day, {name}.", "", DAY_RULES, "",
                              "The session now:", current])
 
+        made = await self._one_day(name, request, kind)
+        if made is None:
+            return None
+        new, problems = made
+        new["day"] = name
+        if focus:  # the same session, lighter or shorter; the card's subtitle says which
+            new["focus"] = focus
+        return new, question, problems
+
+    async def _one_day(self, name: str, request: str, kind: str) -> tuple[dict, list[str]] | None:
+        """Ask Claude for one day's session as card data, check it against the injury rules and
+        have it fixed once. (day data, injury warnings), or None when the reply is unusable.
+        Sign in, limit, network and time out errors are raised."""
         def read(reply: str) -> dict | None:
             raw = normalize_plan(reply) if reply.lstrip().startswith("{") else None
             if raw is None:  # Claude answers with one day, not a week
@@ -3188,12 +3425,86 @@ class Coach:
                 raise
             log.warning("The structured %s version failed (%s), asking for text", kind, exc)
             return None
-        if new is None:
+        return (new, problems) if new is not None else None
+
+    # -- changing the week by hand: swap two days, or put a new session on a day ----
+
+    def week_days(self, monday: date) -> dict[int, dict] | None:
+        """This week's structured plan as {weekday: day data}, or None for a text plan."""
+        data = self.store.load_plan_data(monday)
+        return {DAY_LOOKUP[d["day"].lower()]: d for d in data["days"]} if data else None
+
+    def _save_days(self, monday: date, days: dict[int, dict], edit: str) -> None:
+        data = self.store.load_plan_data(monday)
+        data = {**data, "days": [days[i] for i in sorted(days)]}
+        now = self.now()
+        meta = {**self.store.load_plan_meta(monday), "edited_at": now.isoformat(timespec="seconds"), "edit": edit}
+        self.store.save_plan(monday, plan_to_text(data), meta, now.strftime("%Y%m%d-%H%M%S"), data)
+
+    def open_days(self, today: date) -> list[date]:
+        """The days after today in this week that are not marked done."""
+        sessions = self.store.sessions()
+        days = [today + timedelta(days=i) for i in range(1, 7 - today.weekday())]
+        return [d for d in days if sessions.get(d.isoformat(), {}).get("status") != "done"]
+
+    @staticmethod
+    def _has_part(entry: dict, part: str) -> bool:
+        """By the day's focus only: every upper body day also has a "Shoulder rehab" section,
+        which must not make it count as a shoulders day."""
+        return not entry.get("rest_day") and part.lower().rstrip("s") in entry.get("focus", "").lower()
+
+    def find_part(self, today: date, part: str) -> date | None:
+        """A later day this week that trains this body part, so today can trade with it."""
+        days = self.week_days(monday_of(today)) or {}
+        return next((d for d in self.open_days(today) if d.weekday() in days and self._has_part(days[d.weekday()], part)), None)
+
+    async def swap_days(self, a: date, b: date) -> tuple[str, str] | None:
+        """Trade two days of the same week. Nothing is rewritten, so no exercise is lost.
+        Returns the focus now on a and on b, or None when the week has no structured plan."""
+        monday = monday_of(a)
+        async with self.plan_lock:
+            days = self.week_days(monday)
+            if not days or a.weekday() not in days or b.weekday() not in days:
+                return None
+            x, y = days[a.weekday()], days[b.weekday()]
+            days[a.weekday()], days[b.weekday()] = {**y, "day": x["day"]}, {**x, "day": y["day"]}
+            self._save_days(monday, days, f"swapped {x['day']} and {y['day']}")
+        self.vault.event("🔁", "workouts swapped", f"{x['day']}: {y['focus']} · {y['day']}: {x['focus']}", workout_title(a))
+        return y["focus"], x["focus"]
+
+    async def new_session(self, day: date, focus: str) -> tuple[dict, list[str]] | None:
+        """Have Claude write a full session with this focus and put it on that day of the plan.
+        (day data, injury warnings), or None when the week has no structured plan or the reply fails."""
+        monday = monday_of(day)
+        name = DAY_NAMES[day.weekday()]
+        if not self.cfg.structured_plans or not self.week_days(monday):
             return None
-        new["day"] = name
-        if focus:  # the same session, lighter or shorter; the card's subtitle says which
-            new["focus"] = focus
-        return new, question, problems
+        when = "today" if day == self.today() else f"{name} {day.day} {day:%b}"
+        request = "\n".join([
+            f"Give me a full {focus} session for {when}.",
+            "Make it a normal session of my usual length, with this week's main equipment and effort, and follow "
+            "my injury rules. Do not repeat exercises that are already in this week's plan, except the rehab block.",
+            f"Return only this one day, {name}.", "", DAY_RULES, "", "This week's plan:",
+            self.store.load_plan(monday) or "",
+        ])
+        made = await self._one_day(name, request, "new")
+        if made is None:
+            return None
+        new, problems = made
+        new = {**new, "day": name, "focus": focus[:1].upper() + focus[1:], "rest_day": False}
+        async with self.plan_lock:
+            days = self.week_days(monday)
+            if not days:
+                return None
+            days[day.weekday()] = new
+            self._save_days(monday, days, f"new {focus} session on {name}")
+        self.vault.event("➕", "session added", f"{name}: {new['focus']}", workout_title(day))
+        return new, problems
+
+    def sitting_out(self, monday: date) -> str:
+        """The upper body part that has no day this week (four parts on three days)."""
+        planned = set(week_split(self.week_number(monday)).values())
+        return next((part for part in UPPER_BODY_ROTATION if part not in planned), "Full body")
 
     def capture_checkin(self, message) -> str | None:
         """Save a reply to the Sunday check in, or the next message before the plan time."""
@@ -3407,6 +3718,11 @@ COMMANDS = [
     ("progress", "Weights from your logs"),
     ("injury", "Show or replace your injury notes"),
     ("away", "Days away, on leave or travelling"),
+    ("sick", "Sick: rest days with no reminders, like /sick 3"),
+    ("off", "Days off with no training, like /off sat sun"),
+    ("swap", "Do another workout today, like /swap arms"),
+    ("add", "Add a workout on a rest day, like /add sat arms"),
+    ("food", "Calories and protein from FoodLens"),
     ("profile", "What the coach knows about you"),
     ("gymstatus", "Claude Code, sign in and reminders"),
     ("reset", "Clear the chat memory"),
@@ -3418,6 +3734,8 @@ HELP_TEXT = """• Just write to me, or use /coach, with any training question.
 • /plan rebuilds this week and /nextweek builds next week. Add notes after the command.
 • /log what you did, then /done when you finish a session.
 • /shoulder shows your shoulder ratings, /injury your injury notes.
+• /sick or /off for days with no training, /swap arms to change today, /add sat arms for an extra day.
+• /food shows your calories and protein from FoodLens.
 • /profile, /gymstatus, /reset and /whoami are there too."""
 
 
@@ -3783,6 +4101,279 @@ async def cmd_injury(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await reply(update, context, card("injury", "saved", "Injury notes saved. The coach will use them from now on."))
 
 
+def command_name(update: Update) -> str:
+    words = (update.effective_message.text or "").split()
+    return words[0].lstrip("/").split("@")[0].lower() if words else ""
+
+
+def _span(start: date, end: date, today: date) -> str:
+    if start == end:
+        return "today" if start == today else fmt_day(start)
+    return f"{fmt_day(start)} to {fmt_day(end)}"
+
+
+def rest_saved(coach: Coach, start: date, end: date, kind: str, note: str) -> list[str]:
+    today = coach.today()
+    what = "sick" if kind == "sick" else "off"
+    text = f"Saved: {what} {_span(start, end, today)}" + (f" ({note})" if note else "") + ". "
+    text += "Rest and recover. " if kind == "sick" else "Enjoy the break. "
+    text += "I will not send workouts or ask whether you trained on those days, and they do not count as skipped."
+    tips = []
+    if kind == "sick":
+        tips.append("Your first session back will come with a note to go lighter.")
+    if start <= monday_of(today) + timedelta(days=6) and coach.store.load_plan(monday_of(today)):
+        tips.append("When you are back, send /plan to rebuild the rest of this week, or /swap to move a session.")
+    return card("rest", "saved", text, *tips, hint="Back earlier? Send /sick clear.")
+
+
+async def cmd_rest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/sick and /off: days with no training at all, and no reminders."""
+    coach = coach_of(context)
+    today = coach.today()
+    kind = "sick" if command_name(update) == "sick" else "off"
+    arg = args_text(update).strip()
+    if arg.lower() in ("clear", "none", "cancel", "better", "back", "ok", "well"):
+        coach.clear_rest()
+        await reply(update, context, card("rest", "cleared", "Rest days from today on are cleared. Welcome back.",
+                                          hint="Send /today for today's workout, or /plan to rebuild the rest of the week."))
+        return
+    try:
+        if not arg:
+            start, end, note = today, today, ""
+        elif m := re.fullmatch(r"(\d{1,2})(?:\s*days?)?", arg, re.IGNORECASE):
+            if not 1 <= int(m[1]) <= 60:
+                raise ValueError("days")
+            start, end, note = today, today + timedelta(days=int(m[1]) - 1), ""
+        else:
+            start, end, note = parse_away(arg, today)
+    except ValueError:
+        await reply(update, context, card("rest", "", "I could not read that. Try /sick (today), /sick 3 (three days from "
+                                          "today), /sick mon to wed, or /off 20 Dec to 2 Jan holiday."))
+        return
+    coach.add_rest(start, end, kind, note)
+    await reply(update, context, rest_saved(coach, start, end, kind, note))
+
+
+async def on_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """🤒 Sick today, from the morning card."""
+    query = update.callback_query
+    coach = coach_of(context)
+    try:
+        _, day_raw, kind = query.data.split(":")
+        day = date.fromisoformat(day_raw)
+    except ValueError:
+        await query.answer()
+        return
+    if day != coach.today() or kind not in REST_KINDS:
+        await query.answer(f"That button was for {fmt_day(day)}. Send /sick for today.", show_alert=True)
+        return
+    if coach.store.sessions().get(day.isoformat(), {}).get("status") == "done":
+        await query.answer("Today is already marked done.", show_alert=True)
+        return
+    if not coach.rest_on(day):  # a second tap changes nothing
+        coach.add_rest(day, day, kind)
+    await query.answer()
+    await reply(update, context, rest_saved(coach, day, day, kind, ""))
+
+
+NO_DATA_PLAN = "This needs this week's plan in the card format. Send /plan to build it first."
+
+
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/add sat arms: a full session on a rest day (or a skipped one)."""
+    coach = coach_of(context)
+    today = coach.today()
+    found = parse_date_prefix(args_text(update), today) if args_text(update).strip() else None
+    if not found:
+        await reply(update, context, card("add", "which day?", "Tell me the day and, if you like, what to train: "
+                                          "/add sat arms, /add sun legs or /add tomorrow back.",
+                                          hint="With no body part I pick the one that sits out this week."))
+        return
+    day, rest = found
+    monday = monday_of(day)
+    days = coach.week_days(monday)
+    name = DAY_NAMES[day.weekday()]
+    if day < today:
+        await reply(update, context, card("add", "", f"{fmt_day(day)} has passed. Pick today or a later day."))
+        return
+    if not days or day.weekday() not in days:
+        await reply(update, context, card("add", "", NO_DATA_PLAN if monday == monday_of(today) else
+                                          "That week has no plan yet. Send /nextweek to build it first."))
+        return
+    entry = days[day.weekday()]
+    if coach.store.sessions().get(day.isoformat(), {}).get("status") == "done":
+        await reply(update, context, card("add", "", f"{name} is already marked done."))
+        return
+    if not entry.get("rest_day") and "skipped" not in entry["focus"].lower():
+        await reply(update, context, card("add", "", f"{name} already has {entry['focus']}.",
+                                          hint="To change it, use /swap on that day, or pick a rest day."))
+        return
+    focus = _one_line(rest.strip(" ,:;-"))[:60] or coach.sitting_out(monday)
+    await reply(update, context, card("add", fmt_day(day), f"Writing a {focus} session for {name}. This takes a minute."))
+    try:
+        async with typing(context.bot, update.effective_chat.id):
+            made = await coach.new_session(day, focus)
+    except ClaudeError as exc:
+        await reply(update, context, card("error", "", exc.user_message))
+        return
+    if not made:
+        await reply(update, context, card("error", "", "I could not write that session. Try again, or ask /coach."))
+        return
+    blocks = coach.day_view(day, header("add", f"{made[0]['focus']} added on {fmt_day(day)}")) or []
+    if made[1]:
+        blocks.insert(-1, to_html(warnings_text(made[1])))
+    await reply(update, context, blocks, reply_markup=alt_keyboard(day) if day == today else None)
+
+
+def swap_keyboard(coach: Coach, today: date) -> InlineKeyboardMarkup | None:
+    """One button per later day this week (a straight trade), then the body parts the rest of
+    the week does not have (the coach writes those)."""
+    days = coach.week_days(monday_of(today))
+    if not days:
+        return None
+    buttons, seen = [], [days.get(today.weekday(), {})]
+    for d in coach.open_days(today):
+        entry = days.get(d.weekday())
+        if entry:
+            seen.append(entry)
+            buttons.append(InlineKeyboardButton(f"{DAY_NAMES[d.weekday()][:3]}: {entry['focus'][:24]}",
+                                                callback_data=f"swp:{today.isoformat()}:{d.weekday()}"))
+    for part in SWAP_PARTS:
+        if not any(Coach._has_part(entry, part) for entry in seen if entry):
+            buttons.append(InlineKeyboardButton(f"💪 {part}", callback_data=f"swp:{today.isoformat()}:p{part}"))
+    return InlineKeyboardMarkup([buttons[i:i + 2] for i in range(0, len(buttons), 2)]) if buttons else None
+
+
+async def send_swap_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, coach: Coach) -> None:
+    today = coach.today()
+    markup = swap_keyboard(coach, today)
+    if not markup:
+        await reply(update, context, card("swap", "", NO_DATA_PLAN))
+        return
+    entry = (coach.week_days(monday_of(today)) or {}).get(today.weekday(), {})
+    await reply(update, context, card(
+        "swap", fmt_day(today), f"Today is **{entry.get('focus', 'not planned')}**. What do you want to do instead?",
+        hint="A day trades places with today, so nothing is lost. A body part is a new session your coach writes."),
+        reply_markup=markup)
+
+
+async def _swap_done(update, context, coach: Coach, a: date, b: date, focuses: tuple[str, str] | None) -> None:
+    if not focuses:
+        await reply(update, context, card("swap", "", NO_DATA_PLAN))
+        return
+    today = coach.today()
+    name = lambda d: "Today" if d == today else DAY_NAMES[d.weekday()]  # noqa: E731
+    await reply(update, context, card("swap", "done", f"{name(a)} is now **{focuses[0]}**. {name(b)} takes **{focuses[1]}**."))
+    if today in (a, b):
+        view = coach.day_view(today)
+        entry = (coach.week_days(monday_of(today)) or {}).get(today.weekday(), {})
+        if view:
+            await reply(update, context, view, reply_markup=None if entry.get("rest_day") else alt_keyboard(today))
+
+
+async def _swap_part(update, context, coach: Coach, part: str) -> None:
+    today = coach.today()
+    days = coach.week_days(monday_of(today))
+    if not days or today.weekday() not in days:
+        await reply(update, context, card("swap", "", NO_DATA_PLAN))
+        return
+    entry = days[today.weekday()]
+    if Coach._has_part(entry, part):
+        await reply(update, context, card("swap", "", f"Today is already {entry['focus']}."))
+        return
+    other = coach.find_part(today, part)
+    if other:  # that body part is later this week: the two days trade places
+        await _swap_done(update, context, coach, today, other, await coach.swap_days(today, other))
+        return
+    await reply(update, context, card("swap", fmt_day(today), f"Writing a {part} session for today. This takes a minute."))
+    try:
+        async with typing(context.bot, update.effective_chat.id):
+            made = await coach.new_session(today, part)
+    except ClaudeError as exc:
+        await reply(update, context, card("error", "", exc.user_message))
+        return
+    if not made:
+        await reply(update, context, card("error", "", "I could not write that session. Try again, or ask /coach."))
+        return
+    blocks = coach.day_view(today, header("swap", f"today is now {made[0]['focus']}")) or []
+    if made[1]:
+        blocks.insert(-1, to_html(warnings_text(made[1])))
+    await reply(update, context, blocks, reply_markup=alt_keyboard(today))
+    if not entry.get("rest_day"):
+        await reply(update, context, card("swap", "", f"{entry['focus']} is off this week's plan now.",
+                                          hint=f"To put it back on a rest day, send /add sat {entry['focus'].split(',')[0].lower()}."))
+
+
+async def _swap_two(update, context, coach: Coach, a: date, b: date) -> None:
+    today = coach.today()
+    sessions = coach.store.sessions()
+    if a == b:
+        await reply(update, context, card("swap", "", "Those are the same day."))
+    elif min(a, b) < today:
+        await reply(update, context, card("swap", "", "I can only swap today and later days of this week."))
+    elif any(sessions.get(d.isoformat(), {}).get("status") == "done" for d in (a, b)):
+        await reply(update, context, card("swap", "", "One of those days is already marked done."))
+    else:
+        await _swap_done(update, context, coach, a, b, await coach.swap_days(a, b))
+
+
+async def cmd_swap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/swap arms (today becomes arms), /swap fri (today trades with Friday), /swap tue thu."""
+    coach = coach_of(context)
+    today = coach.today()
+    monday = monday_of(today)
+    words = args_text(update).lower().replace(",", " ").split()
+    if not words:
+        await send_swap_menu(update, context, coach)
+        return
+    pick = lambda w: {"today": today.weekday(), "tomorrow": (today.weekday() + 1) % 7}.get(w, DAY_LOOKUP.get(w.strip(".")))  # noqa: E731
+    first = pick(words[0])
+    if first is None:
+        await _swap_part(update, context, coach, _one_line(" ".join(words))[:60])
+        return
+    second = pick(words[1]) if len(words) > 1 else None
+    a, b = (first, second) if second is not None else (today.weekday(), first)
+    await _swap_two(update, context, coach, monday + timedelta(days=a), monday + timedelta(days=b))
+
+
+async def on_swap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """🔁 Swap workout: the menu, then a day or a body part."""
+    query = update.callback_query
+    coach = coach_of(context)
+    try:
+        _, day_raw, target = query.data.split(":")
+        day = date.fromisoformat(day_raw)
+    except ValueError:
+        await query.answer()
+        return
+    today = coach.today()
+    if day != today:
+        await query.answer(f"That button was for {fmt_day(day)}. Send /swap for today.", show_alert=True)
+        return
+    if coach.store.sessions().get(today.isoformat(), {}).get("status") == "done":
+        await query.answer("Today is already marked done.", show_alert=True)
+        return
+    busy = context.application.bot_data.setdefault("swap_busy", set())
+    if busy:
+        await query.answer("Already changing your plan…")
+        return
+    busy.add(query.data)
+    try:
+        await query.answer()
+        if target == "menu":
+            await send_swap_menu(update, context, coach)
+        elif target.isdigit() and int(target) < 7:
+            await _swap_two(update, context, coach, today, monday_of(today) + timedelta(days=int(target)))
+        elif target.startswith("p") and target[1:] in SWAP_PARTS:
+            await _swap_part(update, context, coach, target[1:])
+    finally:
+        busy.discard(query.data)
+
+
+async def cmd_food(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await reply(update, context, coach_of(context).food_view())
+
+
 def away_text(coach: Coach) -> list[str]:
     today = coach.today()
     periods = [p for p in coach.store.away() if p["end"] >= today.isoformat()]
@@ -3790,7 +4381,9 @@ def away_text(coach: Coach) -> list[str]:
     for p in periods:
         start, end = date.fromisoformat(p["start"]), date.fromisoformat(p["end"])
         span = fmt_day(start) if start == end else f"{fmt_day(start)} to {fmt_day(end)}"
-        parts.append(f"✈️ **{span}**" + (f" · {p['note']}" if p.get("note") else ""))
+        emoji, kind = REST_KINDS.get(p.get("kind"), ("✈️", ""))
+        label = " · ".join(x for x in (kind.split(",")[0], p.get("note") or "") if x)
+        parts.append(f"{emoji} **{span}**" + (f" · {label}" if label else ""))
     if not periods:
         parts.append("No days away saved.")
     holidays_ahead = [(d, label) for d, label in coach.days_off(today, today + timedelta(days=60)) if label.startswith("public")]
@@ -3817,7 +4410,8 @@ async def cmd_away(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except ValueError:
         await reply(update, context, card("away", "", "I could not read those dates. Try /away 8 Oct to 10 Oct Bangkok trip, /away thu fri, or /away tomorrow hotel gym only."))
         return
-    periods = [p for p in coach.store.away() if p["end"] >= today.isoformat()]
+    keep = (today - timedelta(days=14)).isoformat()  # recent sick days stay, for the ease back in
+    periods = [p for p in coach.store.away() if p["end"] >= keep]
     periods.append({"start": start.isoformat(), "end": end.isoformat(), "note": note})
     coach.store.set_away(periods)
     span = fmt_day(start) if start == end else f"{fmt_day(start)} to {fmt_day(end)}"
@@ -4432,6 +5026,12 @@ def add_handlers(application: Application, concurrent: bool = True) -> None:
     application.add_handler(CallbackQueryHandler(on_alt, pattern=r"^alt:", **slow))
     application.add_handler(CommandHandler("injury", cmd_injury))
     application.add_handler(CommandHandler("away", cmd_away))
+    application.add_handler(CommandHandler(["sick", "off"], cmd_rest))
+    application.add_handler(CommandHandler("add", cmd_add, **slow))
+    application.add_handler(CommandHandler("swap", cmd_swap, **slow))
+    application.add_handler(CommandHandler("food", cmd_food))
+    application.add_handler(CallbackQueryHandler(on_off, pattern=r"^off:"))
+    application.add_handler(CallbackQueryHandler(on_swap, pattern=r"^swp:", **slow))
     application.add_handler(CommandHandler("profile", cmd_profile))
     application.add_handler(CommandHandler(["gymstatus", "status"], cmd_status, **slow))
     application.add_handler(CommandHandler("reset", cmd_reset))
@@ -4493,7 +5093,11 @@ def alt_keyboard(day: date) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton("🪶 Lighter version", callback_data=f"alt:{day.isoformat()}:light"),
                 InlineKeyboardButton("⏱ 30 minute version", callback_data=f"alt:{day.isoformat()}:short"),
-            ]
+            ],
+            [
+                InlineKeyboardButton("🔁 Swap workout", callback_data=f"swp:{day.isoformat()}:menu"),
+                InlineKeyboardButton("🤒 Sick today", callback_data=f"off:{day.isoformat()}:sick"),
+            ],
         ]
     )
 
@@ -4505,15 +5109,22 @@ async def job_daily_workout(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def job_session_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Today's session before the gym."""
-    await send_day_session(context, header("session"), header("session", "Rest day today"))
+    await send_day_session(context, header("session"), header("session", "Rest day today"), nudge=True)
 
 
-async def send_day_session(context: ContextTypes.DEFAULT_TYPE, heading: str, rest_heading: str) -> None:
-    """heading / rest_heading: header() lines for a training day / a rest day."""
+async def send_day_session(context: ContextTypes.DEFAULT_TYPE, heading: str, rest_heading: str,
+                           nudge: bool = False) -> None:
+    """heading / rest_heading: header() lines for a training day / a rest day.
+    nudge: the reminder before the gym, which stays quiet on a sick day or day off."""
     coach = coach_of(context)
     today = coach.today()
     monday = monday_of(today)
     if coach.store.sessions().get(today.isoformat(), {}).get("status") == "done":
+        return
+    if coach.rest_on(today):  # sick or off: one short card in the morning, no workout, no plan build
+        if not nudge:
+            await owner_send(context, card("rest", fmt_day(today), coach.day_off_line(today) or "Rest day.",
+                                           hint="Back on your feet? Send /sick clear."))
         return
     if not coach.store.load_plan(monday):
         if not coach.program_start():
@@ -4531,7 +5142,8 @@ async def send_day_session(context: ContextTypes.DEFAULT_TYPE, heading: str, res
     day = parse_plan(coach.store.load_plan(monday) or "").days.get(today.weekday())
     rest = bool(day and day.is_rest)
     note = coach.recovery_note(today, rest_day=rest)
-    cards = coach.day_view(today, rest_heading if rest else heading, [note] if note else None) if day else None
+    back = None if rest else coach.back_note(today)
+    cards = coach.day_view(today, rest_heading if rest else heading, [n for n in (note, back) if n] or None) if day else None
     sent = "rest day sent" if rest else "workout sent"
     if cards:
         await owner_send(context, cards, reply_markup=None if rest else alt_keyboard(today))
@@ -4544,8 +5156,9 @@ async def send_day_session(context: ContextTypes.DEFAULT_TYPE, heading: str, res
         off = coach.day_off_line(today)
         blocks = [rest_heading if day.is_rest else heading, *([to_html(off)] if off else []), *text_blocks(day.text)]
         markup = None if day.is_rest else alt_keyboard(today)
-    if note:
-        blocks.append(to_html(note))
+    for extra in (note, back):
+        if extra:
+            blocks.append(to_html(extra))
     await owner_send(context, blocks, reply_markup=markup)
     coach.vault.event("📨", sent, _visible(heading), workout_title(today))
 
@@ -4623,8 +5236,8 @@ async def job_evening_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Ask whether I trained, if /done was not sent on a training day."""
     coach = coach_of(context)
     today = coach.today()
-    if coach.store.sessions().get(today.isoformat()):
-        return
+    if coach.store.sessions().get(today.isoformat()) or coach.rest_on(today):
+        return  # answered already, or a sick day / day off: no question
     plan = coach.store.load_plan(monday_of(today))
     if not plan and (not coach.program_start() or before_programme(coach, monday_of(today))):
         return
@@ -4643,7 +5256,8 @@ async def job_evening_check(context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
     focus = f" ({day.focus})" if day else ""
-    await owner_send(context, card("evening", fmt_day(today), f"Did you train today{focus}?"),
+    food = coach.food_line(today)
+    await owner_send(context, card("evening", fmt_day(today), f"Did you train today{focus}?", *([food] if food else [])),
                      reply_markup=check_keyboard(today))
 
 

@@ -42,8 +42,8 @@ def run(api: FakeBotAPI, expect_garmin: bool = True, claude_version: str = "2.1.
     _, cmds = api.wait_for(lambda m, p: m == "setMyCommands", 60)
     names = [c["command"] for c in cmds["commands"]]
     assert names == ["coach", "today", "week", "day", "plan", "nextweek", "log", "done", "shoulder", "progress",
-                     "injury", "away", "profile", "gymstatus", "reset", "whoami"], names
-    done.append("command menu registered (16 commands)")
+                     "injury", "away", "sick", "off", "swap", "add", "food", "profile", "gymstatus", "reset", "whoami"], names
+    done.append("command menu registered (21 commands)")
     _, poll = api.wait_for(lambda m, p: m == "getUpdates" and "allowed_updates" in p, 60)
     assert sorted(poll["allowed_updates"]) == ["callback_query", "message"], poll
     done.append("long polling for messages and button presses")

@@ -32,7 +32,7 @@ async def test_daily_workout_every_morning(app, claude, clock, cfg):
     await bot.job_daily_workout(ctx(app))
     sent = app.tg.sent()[-1]
     assert sent["text"].startswith("☀️ <b>GOOD MORNING</b> · Today's workout\n\n📅 Thursday: Upper body and rehab")
-    assert keyboard_data(sent) == ["alt:2026-10-01:light", "alt:2026-10-01:short"]
+    assert keyboard_data(sent) == ["alt:2026-10-01:light", "alt:2026-10-01:short", "swp:2026-10-01:menu", "off:2026-10-01:sick"]
 
 
 async def test_daily_workout_on_a_rest_day(app, claude, clock):
@@ -58,7 +58,7 @@ async def test_pre_gym_reminder_has_the_buttons_too(app, claude, clock):
     await send(app, "/plan")
     clock.set(2026, 9, 30, 17, 30)
     await bot.job_session_reminder(ctx(app))
-    assert keyboard_data(app.tg.sent()[-1]) == ["alt:2026-09-30:light", "alt:2026-09-30:short"]
+    assert keyboard_data(app.tg.sent()[-1]) == ["alt:2026-09-30:light", "alt:2026-09-30:short", "swp:2026-09-30:menu", "off:2026-09-30:sick"]
 
 
 async def test_empty_times_turn_reminders_off(env, clock):
