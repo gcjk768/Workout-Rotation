@@ -352,3 +352,13 @@ async def test_menu_lists_every_command_and_the_food_block_follows_the_shared_to
     assert all(len(block) < 4000 for block in bot.menu_view(coach.cfg))
     assert "/menu shows every command" in (await send(app, "/help"))[0]
 
+
+async def test_ask_is_in_the_menu_and_answers_like_coach(app, claude):
+    assert ("ask", "Ask about training or food") in bot.COMMANDS
+    assert "/ask is my protein enough" in "\n\n".join(bot.menu_view(app.bot_data["coach"].cfg))
+    before = len(claude.all())
+    await send(app, "/ask is my protein enough for today")
+    assert len(claude.all()) == before + 1 and "is my protein enough for today" in claude.last()["stdin"]
+    assert "Send /ask followed by your question" in (await send(app, "/ask"))[0]   # no question: how to use it
+    assert len(claude.all()) == before + 1                                            # and no Claude call for that
+

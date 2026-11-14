@@ -3781,6 +3781,7 @@ class Coach:
 
 COMMANDS = [
     ("menu", "Every command on one card"),
+    ("ask", "Ask about training or food"),
     ("coach", "Ask your coach anything"),
     ("today", "Today's workout"),
     ("week", "This week's plan (next week's on weekends)"),
@@ -3804,7 +3805,7 @@ COMMANDS = [
     ("whoami", "Your Telegram user ID"),
 ]
 
-HELP_TEXT = """• Just write to me, or use /coach, with any training question.
+HELP_TEXT = """• Just write to me, or use /ask (or /coach), with any training or food question.
 • /today shows today's workout, /day fri any day's, and /week the whole week.
 • /plan rebuilds this week and /nextweek builds next week. Add notes after the command.
 • /log what you did, then /done when you finish a session.
@@ -3860,7 +3861,8 @@ def menu_view(cfg: Config) -> list[str]:
         "/injury · injury notes\n"
         "/profile · what the coach knows about me",
         "💬 **Ask**\n"
-        "Just type a question, or /coach how do I warm up my shoulder",
+        "/ask is my protein enough for today's session · training or food, the coach sees both\n"
+        "Or just type the question (/coach is the same as /ask)",
         "⚙️ **Other**\n"
         "/gymstatus · is everything running\n"
         "/reset · clear the chat memory\n"
