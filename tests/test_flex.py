@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import date
 from types import SimpleNamespace
@@ -335,4 +336,19 @@ async def test_no_food_log_means_no_fuel_rule(app, claude, clock):
     coach = app.bot_data["coach"]
     assert coach.fuel_rule(coach.today()) is None and coach.fuel_note(coach.today()) is None
     assert "food and drink" not in coach.plan_request(MONDAY, "")
+
+
+async def test_menu_lists_every_command_and_the_food_block_follows_the_shared_topic(app):
+    coach = app.bot_data["coach"]
+    text = "\n\n".join(await send(app, "/menu"))
+    assert text.startswith("🧭 <b>MENU</b> · tap a command")
+    listed = set(re.findall(r"/([a-z_]+)", text))
+    assert {name for name, _ in bot.COMMANDS} - {"whoami"} <= listed    # every command in the Telegram menu is on the card
+    assert "/swap · choose another workout for today" in text and "/sick clear · I am back" in text
+    assert "/ate" not in text and "/food · calories and protein from FoodLens" in text
+    coach.cfg.shared_topic = True   # FoodLens lives in the same topic: its commands are listed too
+    shared = "\n\n".join(bot.menu_view(coach.cfg))
+    assert "/ate 2 kaya toast, kopi c · a meal in words" in shared and "Send a photo of the meal" in shared
+    assert all(len(block) < 4000 for block in bot.menu_view(coach.cfg))
+    assert "/menu shows every command" in (await send(app, "/help"))[0]
 

@@ -2427,6 +2427,7 @@ SECTION_TITLES = {  # message type -> (fixed emoji, TITLE)
     "swap": ("🔁", "SWAP WORKOUT"),
     "add": ("➕", "EXTRA WORKOUT"),
     "food": ("🍽", "FOOD INTAKE"),
+    "menu": ("🧭", "MENU"),
     "memory": ("🧹", "CHAT MEMORY"),
     "profile": ("👤", "PROFILE"),
     "status": ("🩺", "GYM STATUS"),
@@ -3779,6 +3780,7 @@ class Coach:
 # ---------------------------------------------------------------------------
 
 COMMANDS = [
+    ("menu", "Every command on one card"),
     ("coach", "Ask your coach anything"),
     ("today", "Today's workout"),
     ("week", "This week's plan (next week's on weekends)"),
@@ -3809,7 +3811,62 @@ HELP_TEXT = """• Just write to me, or use /coach, with any training question.
 • /shoulder shows your shoulder ratings, /injury your injury notes.
 • /sick or /off for days with no training, /swap arms to change today, /add sat arms for an extra day.
 • /food shows your calories and protein from FoodLens.
-• /profile, /gymstatus, /reset and /whoami are there too."""
+• /profile, /gymstatus, /reset and /whoami are there too.
+• /menu shows every command on one card."""
+
+
+def menu_view(cfg: Config) -> list[str]:
+    """Every command on one card, grouped by what I want to do. Commands are plain text, so a tap sends
+    them; the ones that need words after them (like /swap arms) answer with how to use them.
+    The food block lists FoodLens's commands when that bot shares this topic."""
+    parts = [
+        "🏋️ **Today**\n"
+        "/today · today's workout\n"
+        "/done · I finished it\n"
+        "/log · write down what I lifted, like /log bench 40 kg 3x10",
+        "🗓 **The week**\n"
+        "/week · the whole week\n"
+        "/day fri · any day's workout\n"
+        "/plan · rebuild this week\n"
+        "/nextweek · build next week now",
+        "🔁 **Change it**\n"
+        "/swap · choose another workout for today (or /swap arms, /swap fri)\n"
+        "/add sat arms · a workout on a rest day",
+        "🛌 **Not training**\n"
+        "/sick · sick today (/sick 3 for three days)\n"
+        "/off sat sun · days off, like a holiday\n"
+        "/away 8 Oct to 10 Oct · travelling, hotel gym workouts\n"
+        "/sick clear · I am back",
+    ]
+    if cfg.shared_topic:
+        parts.append(
+            "🍽 **Food** (FoodLens)\n"
+            "📷 Send a photo of the meal · it works out the calories\n"
+            "/ate 2 kaya toast, kopi c · a meal in words\n"
+            "/food · calories and protein against my targets\n"
+            "/water 2 · cups of water\n"
+            "/yesterday · yesterday's food\n"
+            "/undo · remove the last meal\n"
+            "/edit · fix a meal from today\n"
+            "/steps 8500 · today's steps\n"
+            "/weight 78 · body weight\n"
+            "↩️ Reply to a meal card to answer its question or correct it")
+    else:
+        parts.append("🍽 **Food**\n/food · calories and protein from FoodLens")
+    parts += [
+        "🩹 **Body and progress**\n"
+        "/shoulder · shoulder ratings (/shoulder 3 to add one)\n"
+        "/progress · weights from my logs\n"
+        "/injury · injury notes\n"
+        "/profile · what the coach knows about me",
+        "💬 **Ask**\n"
+        "Just type a question, or /coach how do I warm up my shoulder",
+        "⚙️ **Other**\n"
+        "/gymstatus · is everything running\n"
+        "/reset · clear the chat memory\n"
+        "/menu · this card",
+    ]
+    return card("menu", "tap a command", *parts, hint="A command with words after it, like /swap arms, can be typed in full or tapped for a reminder of how it works.")
 
 
 def coach_of(context: ContextTypes.DEFAULT_TYPE) -> Coach:
@@ -4653,6 +4710,10 @@ def foreign_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return sender is not None and sender.is_bot and sender.id != context.bot.id
 
 
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await reply(update, context, menu_view(coach_of(context).cfg))
+
+
 async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if in_shared_topic(update, context):
         return  # most likely the other bot's command (/ate, /steps, /water): stay quiet
@@ -5100,6 +5161,7 @@ def add_handlers(application: Application, concurrent: bool = True) -> None:
     slow = {"block": not concurrent}
     application.add_handler(CommandHandler(["start", "help"], cmd_start))
     application.add_handler(CommandHandler("whoami", cmd_whoami))
+    application.add_handler(CommandHandler(["menu", "commands"], cmd_menu))
     application.add_handler(CommandHandler(["coach", "ask", "ask_coach"], cmd_ask, **slow))
     application.add_handler(CommandHandler("today", cmd_today))
     application.add_handler(CommandHandler("week", cmd_week))
