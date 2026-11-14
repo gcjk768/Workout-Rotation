@@ -251,3 +251,30 @@ async def test_no_foodlens_database_changes_nothing(app, claude, clock):
     assert coach.food_line(coach.today()) is None and coach.food_context(coach.today()) is None
     assert "I cannot read FoodLens's database." in (await send(app, "/food"))[0]
     assert "FoodLens" not in coach.system_prompt()
+
+
+# ---------------------------------------------------------------------------
+# One topic shared with FoodLens (SHARED_TOPIC=on)
+# ---------------------------------------------------------------------------
+
+def _in_topic(coach, shared: bool, reply_from=None, private: bool = False):
+    coach.cfg.shared_topic = shared
+    reply = SimpleNamespace(from_user=SimpleNamespace(id=reply_from[0], is_bot=reply_from[1])) if reply_from else None
+    update = SimpleNamespace(effective_message=SimpleNamespace(reply_to_message=reply, text="150"),
+                             effective_chat=SimpleNamespace(type="private" if private else "supergroup"))
+    context = SimpleNamespace(application=SimpleNamespace(bot_data={"coach": coach}), bot=SimpleNamespace(id=42))
+    return update, context
+
+
+def test_shared_topic_leaves_replies_to_the_other_bot_alone(coach):
+    assert bot.foreign_reply(*_in_topic(coach, True, (777, True)))        # a reply to FoodLens: not for the coach
+    assert not bot.foreign_reply(*_in_topic(coach, True, (42, True)))     # a reply to the coach itself
+    assert not bot.foreign_reply(*_in_topic(coach, True, (5, False)))     # a reply to a person
+    assert not bot.foreign_reply(*_in_topic(coach, True))                 # plain text is still a question
+    assert not bot.foreign_reply(*_in_topic(coach, False, (777, True)))   # the switch is off: as before
+    assert not bot.foreign_reply(*_in_topic(coach, True, (777, True), private=True))
+    assert bot.in_shared_topic(*_in_topic(coach, True)) and not bot.in_shared_topic(*_in_topic(coach, True, private=True))
+
+
+async def test_unknown_command_still_answers_in_a_private_chat(app):
+    assert "I do not know that command" in (await send(app, "/ate kaya toast"))[0]

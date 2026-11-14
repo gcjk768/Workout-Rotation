@@ -328,6 +328,7 @@ class Config:
     structured_plans: bool = True
     foodlens_db: str = "/foodlens/foodlens.db"  # FoodLens's database, mounted read only
     protein_per_kg: float = 1.6  # protein target for training, grams per kg of body weight
+    shared_topic: bool = False  # FoodLens lives in the same topic: see foreign_reply() and cmd_unknown
     self_repair: bool = True
     repair_alert_chat: tuple[int, int | None] | None = None  # (chat, topic) that also gets 🩺 alerts
     bot_chat: tuple[int, int | None] | None = None  # (group, topic) the bot lives in, instead of the owner's DM
@@ -418,6 +419,7 @@ class Config:
             structured_plans=parse_switch(env.get("STRUCTURED_PLANS"), True),
             foodlens_db=get("FOODLENS_DB", "/foodlens/foodlens.db"),
             protein_per_kg=_float(env.get("FOOD_PROTEIN_PER_KG"), 1.6),
+            shared_topic=parse_switch(env.get("SHARED_TOPIC"), False),
             self_repair=parse_switch(env.get("SELF_REPAIR"), True),
             repair_alert_chat=parse_chat(env.get("REPAIR_ALERT_CHAT")),
             bot_chat=parse_chat(env.get("BOT_CHAT"), "BOT_CHAT"),
@@ -3827,7 +3829,7 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """A plain message works like /ask, unless it answers the check in."""
     text = (update.effective_message.text or "").strip()
-    if not text:
+    if not text or foreign_reply(update, context):
         return
     saved = coach_of(context).capture_checkin(update.effective_message)
     if saved:
@@ -4566,7 +4568,23 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await reply(update, context, card("status", "Claude Code, sign in and reminders", text))
 
 
+def in_shared_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    chat = update.effective_chat
+    return coach_of(context).cfg.shared_topic and chat is not None and chat.type != ChatType.PRIVATE
+
+
+def foreign_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """In a topic shared with another bot (FoodLens): a message that replies to that bot's
+    message is an answer to it, not a question for the coach."""
+    if not in_shared_topic(update, context):
+        return False
+    sender = getattr(update.effective_message.reply_to_message, "from_user", None)
+    return sender is not None and sender.is_bot and sender.id != context.bot.id
+
+
 async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if in_shared_topic(update, context):
+        return  # most likely the other bot's command (/ate, /steps, /water): stay quiet
     await reply(update, context, card("help", "I do not know that command", HELP_TEXT))
 
 
