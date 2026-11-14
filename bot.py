@@ -2326,6 +2326,11 @@ REST_KINDS = {  # kind -> (emoji, label for the plan request)
 SWAP_PARTS = ["Chest", "Back", "Shoulders", "Arms", "Legs", "Core"]
 FOOD_KEYS = ("kcal", "protein_g", "carbs_g", "fat_g")
 FOOD_DEFAULT = {"kcal": 2000, "protein_g": 60}  # FoodLens's own defaults until /setup is done there
+# When is a day "under fuelled"? Tunable: these are coaching rules of thumb, not medical limits.
+FUEL_MIN_MEALS = 2        # a day with fewer meals logged is treated as incomplete and not judged
+FUEL_LOW_KCAL = 0.70      # under 70% of the calorie target
+FUEL_LOW_PROTEIN = 0.60   # under 60% of the protein target
+WATER_LOW_CUPS = 4        # fewer cups of water logged than this
 
 
 class FoodReader(GarminReader):
@@ -2360,6 +2365,15 @@ class FoodReader(GarminReader):
             for key in FOOD_KEYS:
                 day[key] += _float((nutrients or {}).get(key), 0.0)
         return {day: {**totals, "meals": len(totals["meals"])} for day, totals in out.items()}
+
+    def water(self, start: date, end: date) -> dict[str, float]:
+        """{"2026-11-14": 6.0}: cups of water logged per day (FoodLens /water). Empty when unreadable."""
+        try:
+            rows = self._query("SELECT day, SUM(cups) AS cups FROM water_log WHERE day >= ? AND day <= ? GROUP BY day",
+                               (start.isoformat(), end.isoformat()))
+        except (FileNotFoundError, sqlite3.Error):
+            return {}
+        return {str(r["day"])[:10]: _float(r["cups"], 0.0) for r in rows}
 
     def targets(self) -> dict:
         """Daily kcal and protein targets as FoodLens shows them."""
@@ -2761,7 +2775,7 @@ class Coach:
     def extra_context(self, now: datetime) -> list[str]:
         today = now.date()
         since = today - timedelta(days=13)
-        parts = [line for line in (self.sick_context(today), self.food_context(today)) if line]
+        parts = [line for line in (self.sick_context(today), self.food_context(today), self.fuel_rule(today)) if line]
         week = self.week_sessions_text(monday_of(today))
         parts.append(
             f"Sessions this week so far: {week}." if week else "Sessions this week so far: none marked done or skipped yet."
@@ -2894,6 +2908,52 @@ class Coach:
         found = self.food.days(day, day).get(day.isoformat())
         return f"🍽 Food logged: {self._food_text(found, self.food_targets())}" if found else None
 
+    def fuel_check(self, today: date) -> list[str]:
+        """What yesterday's food and water say about today's session, as short findings.
+        Empty when yesterday was fine, or was not logged well enough to judge."""
+        yesterday = today - timedelta(days=1)
+        day = self.food.days(yesterday, yesterday).get(yesterday.isoformat())
+        targets = self.food_targets()
+        found = []
+        if day and day["meals"] >= FUEL_MIN_MEALS:
+            if day["kcal"] < FUEL_LOW_KCAL * targets["kcal"]:
+                found.append(f"you ate little yesterday ({day['kcal']:,.0f} of {targets['kcal']:,} kcal)")
+            if day["protein_g"] < FUEL_LOW_PROTEIN * targets["protein_g"]:
+                found.append(f"protein was low yesterday ({day['protein_g']:.0f} of {targets['protein_g']} g)")
+        cups = self.food.water(yesterday, yesterday).get(yesterday.isoformat())
+        if cups is not None and cups < WATER_LOW_CUPS:
+            found.append(f"only {cups:g} cups of water logged yesterday")
+        return found
+
+    def fuel_note(self, today: date) -> str | None:
+        """For the workout card: what to change today because of yesterday's food and drink."""
+        found = self.fuel_check(today)
+        if not found:
+            return None
+        text = "; ".join(found)
+        advice = ["eat a meal with carbs and protein 2 to 3 hours before training"]
+        if any("water" in f for f in found):
+            advice.append("drink 2 to 3 cups of water before you start")
+        if any("ate little" in f for f in found):
+            advice.append("use the 🪶 Lighter version today")
+        else:
+            advice.append("switch to the 🪶 Lighter version if you feel flat")
+        return f"⛽ **Fuel check** · {text[:1].upper()}{text[1:]}. So: " + ", ".join(advice) + "."
+
+    def fuel_rule(self, today: date) -> str | None:
+        """For Claude: how to let my food and drink change the training. None without food data."""
+        if not self.food_days(today - timedelta(days=6), today) and not self.food.water(today - timedelta(days=6), today):
+            return None
+        found = self.fuel_check(today)
+        now = ("Right now: " + "; ".join(found) + ". Treat today as a low fuel day.") if found else \
+            "Right now: yesterday's intake gives no reason to hold back."
+        return ("How my food and drink change my training. When my logged intake is well under target (calories under "
+                f"about {FUEL_LOW_KCAL:.0%} of target, protein under about {FUEL_LOW_PROTEIN:.0%}, or under "
+                f"{WATER_LOW_CUPS} cups of water), make the session easier: fewer sets, about RPE 5 to 6, no "
+                "maximum efforts, and tell me in one line what to eat or drink first. When my intake is on target, "
+                "train as planned. When you build a week, a run of low days means moderate effort and less volume "
+                "for that week, and say so in the notes. Judge only days that are logged. " + now)
+
     def food_days(self, start: date, end: date) -> list[tuple[date, dict]]:
         days = self.food.days(start, end)
         return [(date.fromisoformat(k), days[k]) for k in sorted(days)]
@@ -2916,6 +2976,10 @@ class Coach:
         targets = self.food_targets()
         lines = [f"{fmt_day(d)}: {t['kcal']:.0f} kcal, {t['protein_g']:.0f} g protein, {t['carbs_g']:.0f} g carbs, "
                  f"{t['fat_g']:.0f} g fat, {t['meals']} meals logged" for d, t in days]
+        water = self.food.water(today - timedelta(days=6), today)
+        if water:
+            lines.append("Water logged: " + ", ".join(
+                f"{fmt_day(date.fromisoformat(d))} {c:g} cups" for d, c in sorted(water.items())))
         return ("My food from my FoodLens tracker, last 7 days (targets "
                 f"{targets['kcal']} kcal and {targets['protein_g']} g protein a day). A day that is not listed "
                 "was not logged, it does not mean I ate nothing. Today may be incomplete:\n" + "\n".join(lines))
@@ -2940,7 +3004,11 @@ class Coach:
         if found:
             gap = targets["protein_g"] - found["protein_g"]
             left = (f"💪 About {gap:.0f} g of protein to go today." if gap > 5 else "💪 Protein target reached today.")
-        parts = [now, *([left] if left else []), week, f"📊 {average[:1].upper()}{average[1:]}.", aim]
+        cups = self.food.water(today, today).get(today.isoformat())
+        drink = [f"💧 **Water today** · {cups:g} cups"] if cups is not None else []
+        fuel = self.fuel_note(today)
+        parts = [now, *([left] if left else []), *drink, *([fuel] if fuel else []), week,
+                 f"📊 {average[:1].upper()}{average[1:]}.", aim]
         return card("food", fmt_day(today), *parts,
                     hint="Numbers come from the meals you log in FoodLens. A day with no entry was not logged.")
 
@@ -3140,6 +3208,9 @@ class Coach:
             ]
             if any("full rest" in label for _, label in off):
                 lines.append("Where a day says full rest, plan a rest day with no training at all.")
+        if self.food_days(self.today() - timedelta(days=6), self.today()):
+            lines += ["", "My food and drink log is in your context. Let it set this week's effort and volume as "
+                          "your rules there say, and put one line about eating for training in the notes."]
         back = self.sick_until(monday - timedelta(days=7), sunday)
         if back:
             lines += ["", f"I was sick until {fmt_day(back)}. Make my first two sessions after that lighter, about RPE 5 to 6."]
@@ -5161,7 +5232,8 @@ async def send_day_session(context: ContextTypes.DEFAULT_TYPE, heading: str, res
     rest = bool(day and day.is_rest)
     note = coach.recovery_note(today, rest_day=rest)
     back = None if rest else coach.back_note(today)
-    cards = coach.day_view(today, rest_heading if rest else heading, [n for n in (note, back) if n] or None) if day else None
+    fuel = None if rest else coach.fuel_note(today)
+    cards = coach.day_view(today, rest_heading if rest else heading, [n for n in (note, back, fuel) if n] or None) if day else None
     sent = "rest day sent" if rest else "workout sent"
     if cards:
         await owner_send(context, cards, reply_markup=None if rest else alt_keyboard(today))
@@ -5174,7 +5246,7 @@ async def send_day_session(context: ContextTypes.DEFAULT_TYPE, heading: str, res
         off = coach.day_off_line(today)
         blocks = [rest_heading if day.is_rest else heading, *([to_html(off)] if off else []), *text_blocks(day.text)]
         markup = None if day.is_rest else alt_keyboard(today)
-    for extra in (note, back):
+    for extra in (note, back, fuel):
         if extra:
             blocks.append(to_html(extra))
     await owner_send(context, blocks, reply_markup=markup)

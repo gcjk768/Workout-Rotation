@@ -197,6 +197,7 @@ def foodlens(path: str, meals: list[tuple[str, str, list[dict]]], profile: tuple
         "CREATE TABLE meal_item (id INTEGER PRIMARY KEY, meal_id INTEGER, name VARCHAR, nutrients JSON);"
         "CREATE TABLE profile (id INTEGER PRIMARY KEY, sex VARCHAR, age INTEGER, height_cm FLOAT, weight_kg FLOAT,"
         " activity VARCHAR, goal VARCHAR, overrides JSON);")
+    conn.execute("CREATE TABLE water_log (id INTEGER PRIMARY KEY, day DATE, cups FLOAT)")
     for day, status, items in meals:
         meal = conn.execute("INSERT INTO meal (day, slot, status) VALUES (?, 'lunch', ?)", (day, status)).lastrowid
         for item in items:
@@ -278,3 +279,60 @@ def test_shared_topic_leaves_replies_to_the_other_bot_alone(coach):
 
 async def test_unknown_command_still_answers_in_a_private_chat(app):
     assert "I do not know that command" in (await send(app, "/ate kaya toast"))[0]
+
+
+
+# ---------------------------------------------------------------------------
+# The workout reacts to food and drink
+# ---------------------------------------------------------------------------
+
+def water(path: str, rows: list[tuple[str, float]]) -> None:
+    conn = sqlite3.connect(path)
+    conn.executemany("INSERT INTO water_log (day, cups) VALUES (?, ?)", rows)
+    conn.commit()
+    conn.close()
+
+
+async def test_a_low_fuel_day_changes_the_workout_card_and_the_coach(app, cfg, claude, clock):
+    # yesterday (Tue 29 Sep): two meals, 1,100 kcal and 40 g protein of 2,000 / 125, and 2 cups of water
+    foodlens(cfg.foodlens_db, [("2026-09-29", "logged", [item(600, 25)]), ("2026-09-29", "logged", [item(500, 15)])])
+    water(cfg.foodlens_db, [("2026-09-29", 1.0), ("2026-09-29", 1.0)])
+    coach = app.bot_data["coach"]
+    assert coach.fuel_check(coach.today()) == ["you ate little yesterday (1,100 of 2,000 kcal)",
+                                               "protein was low yesterday (40 of 125 g)",
+                                               "only 2 cups of water logged yesterday"]
+    await send(app, "/plan")
+    before = len(app.tg.sent())
+    await bot.job_daily_workout(ctx(app))
+    card = "\n\n".join(m["text"] for m in app.tg.sent()[before:])
+    assert "⛽ <b>Fuel check</b> · You ate little yesterday (1,100 of 2,000 kcal)" in card
+    assert "drink 2 to 3 cups of water before you start" in card and "use the 🪶 Lighter version today" in card
+    prompt = coach.system_prompt()
+    assert "How my food and drink change my training." in prompt and "Treat today as a low fuel day." in prompt
+    assert "Water logged: Tue 29 Sep 2 cups" in prompt
+    assert "My food and drink log is in your context." in coach.plan_request(MONDAY, "")
+    await press(app, "alt:2026-09-30:light")  # the lighter version is written with that context
+    assert "Treat today as a low fuel day." in claude.plan_calls()[-1]["system"]
+    assert "⛽" in (await send(app, "/food"))[0]
+
+
+async def test_a_well_fed_day_or_a_half_logged_day_changes_nothing(app, cfg, claude, clock):
+    foodlens(cfg.foodlens_db, [("2026-09-29", "logged", [item(900, 60)]), ("2026-09-29", "logged", [item(1000, 55)]),
+                               ("2026-09-28", "logged", [item(300, 5)])])   # Monday: one meal only, not judged
+    water(cfg.foodlens_db, [("2026-09-29", 7.0)])
+    coach = app.bot_data["coach"]
+    assert coach.fuel_check(coach.today()) == [] and coach.fuel_note(coach.today()) is None
+    assert "yesterday's intake gives no reason to hold back" in coach.system_prompt()
+    clock.set(2026, 9, 29, 7, 0)  # Tuesday morning looks back at Monday's single meal
+    assert coach.fuel_check(coach.today()) == []
+    await send(app, "/plan")
+    before = len(app.tg.sent())
+    await bot.job_daily_workout(ctx(app))
+    assert "⛽" not in "\n\n".join(m["text"] for m in app.tg.sent()[before:])
+
+
+async def test_no_food_log_means_no_fuel_rule(app, claude, clock):
+    coach = app.bot_data["coach"]
+    assert coach.fuel_rule(coach.today()) is None and coach.fuel_note(coach.today()) is None
+    assert "food and drink" not in coach.plan_request(MONDAY, "")
+
